@@ -1,0 +1,634 @@
+import base64
+import json
+import logging
+import re
+from functools import partial
+
+from markupsafe import Markup, escape
+
+from odoo import api, fields, models, _
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.tools import html2plaintext
+
+from .providers import SCOPE_REFUSAL, ProviderClient, ProviderError
+from .formatting import format_reply
+from .tools import (
+    CHART_TOOL, available_tools, chart_models, execute_chart, execute_tool, parse_tool_arguments, requested_chart_tool,
+)
+from .limits import (
+    CONVERSATION_LOCK_NAMESPACE, MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES, MAX_LISTED_CONVERSATIONS,
+    MAX_LOADED_MESSAGES, MAX_MESSAGE_CHARS, MAX_TITLE_PROMPTS, WELCOME_SUGGESTIONS, is_restricted_model,
+)
+from .navigation import (
+    accessible_apps, accessible_menu_names, app_structure, apps_using_models, screen_context, screen_details,
+)
+from .native_mcp import MAX_UPLOAD_BYTES
+
+
+_logger = logging.getLogger(__name__)
+_BOT_POST = object()
+
+
+class AIConversation(models.Model):
+    _name = "odoo.ai.assistant.conversation"
+    _description = "Private AI Conversation"
+    _order = "write_date desc, id desc"
+
+    name = fields.Char(required=True, default=lambda self: self.env.ref("odoo_ai_assistant.ai_partner").name)
+    # True until a topic title replaces the default name; renames also clear it.
+    title_pending = fields.Boolean(default=True)
+    user_id = fields.Many2one("res.users", required=True, index=True, ondelete="cascade")
+    channel_id = fields.Many2one("discuss.channel", required=True, ondelete="cascade")
+    message_ids = fields.One2many("odoo.ai.assistant.message", "conversation_id")
+    last_read_message_id = fields.Integer(default=0)
+    _unique_channel = models.Constraint("UNIQUE(channel_id)", "Channel already linked.")
+
+    @api.model
+    def _enabled_for_user(self, config):
+        return self.env.user.has_group("base.group_user") and self.env.user.ai_assistant_enabled and config.enabled
+
+    @api.model
+    def _check_enabled(self):
+        config = self.env["odoo.ai.assistant.config"]._configuration()
+        if not self._enabled_for_user(config):
+            raise AccessError(_("AI Assistant is disabled for your user. Contact your administrator."))
+        return config
+
+    def _owned(self):
+        self.ensure_one()
+        self._check_enabled()
+        if not self.exists() or self.sudo().user_id != self.env.user:
+            raise AccessError(_("This AI conversation belongs to another user."))
+        self.check_access("read")
+        return self
+
+    def write(self, vals):
+        if "name" in vals and "title_pending" not in vals:
+            vals = dict(vals, title_pending=False)
+        return super().write(vals)
+
+    @api.model
+    def bootstrap(self):
+        config = self.env["odoo.ai.assistant.config"]._configuration()
+        enabled = self._enabled_for_user(config)
+        common = {
+            "assistant_name": self.env.ref("odoo_ai_assistant.ai_partner").sudo().name,
+            "max_message_chars": MAX_MESSAGE_CHARS, "max_upload_bytes": MAX_UPLOAD_BYTES,
+        }
+        if not enabled:
+            return {**common, "enabled": False, "conversations": [], "suggestions": [], "channel_ids": []}
+        # Runs on every page load: a fixed number of queries, however many conversations exist.
+        all_conversations = self.search([("user_id", "=", self.env.uid)])
+        conversations = all_conversations[:MAX_LISTED_CONVERSATIONS]
+        Message = self.env["odoo.ai.assistant.message"]
+        latest_ids = [message_id for _conversation, message_id in Message._read_group(
+            [("conversation_id", "in", conversations.ids)], ["conversation_id"], ["id:max"],
+        )]
+        latest_by_conversation = {message.conversation_id.id: message for message in Message.browse(latest_ids)}
+        entries = []
+        for conversation in conversations:
+            latest = latest_by_conversation.get(conversation.id, Message)
+            entries.append({
+                "id": conversation.id, "name": conversation.name,
+                "channel_id": [conversation.channel_id.id, conversation.channel_id.name],
+                "preview": latest.content[:160] if latest else _("This is the start of your conversation"),
+                "date": fields.Datetime.to_string(latest.create_date or conversation.create_date),
+                "unread": bool(latest and latest.id > conversation.last_read_message_id
+                               and latest.role == "assistant"),
+            })
+        return {
+            **common,
+            "enabled": True, "provider": config.provider,
+            "suggestions": [_("What can I do in %s?") % app for app in self._suggested_apps(config)],
+            "model": config.model_id.name or _("Not configured"),
+            "local_tools": config.local_tools,
+            "business_data_sharing": config.business_data_sharing,
+            "conversations": sorted(entries, key=lambda entry: entry["date"], reverse=True),
+            # Every AI channel (not only the listed ones), so Discuss can keep them out of Direct messages.
+            "channel_ids": all_conversations.channel_id.ids,
+        }
+
+    @api.model
+    def _suggested_apps(self, config):
+        """Apps to suggest on the welcome screen: those whose data the AI may read, in menu order;
+        any accessible app when the AI cannot read Odoo data."""
+        models = set(chart_models(self.env)) if config.local_tools else set()
+        apps = (apps_using_models(self.env, models) if models else []) or accessible_apps(self.env)
+        return apps[:WELCOME_SUGGESTIONS]
+
+    @api.model
+    def start_conversation(self, record_model=None, record_id=None):
+        self._check_enabled()
+        partner = self.env.ref("odoo_ai_assistant.ai_partner")
+        name = partner.name
+        if record_model is not None or record_id is not None:
+            if (not isinstance(record_model, str) or record_model not in self.env
+                    or isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0):
+                raise ValidationError(_("Select a saved Odoo record to name this conversation."))
+            record = self.env[record_model].browse(record_id).exists()
+            if not record:
+                raise UserError(_("The record used to name this conversation no longer exists."))
+            record.check_access("read")
+            name = _("AI: %s") % record.display_name
+        title_pending = record_model is None and record_id is None
+        channel = self.env["discuss.channel"].create({
+            "name": name, "channel_type": "group",
+            "channel_partner_ids": [fields.Command.link(partner.id)],
+        })
+        conversation = self.sudo().create({
+            "name": name, "user_id": self.env.uid, "channel_id": channel.id,
+            "title_pending": title_pending,
+        })
+        return {"id": conversation.id, "name": conversation.name, "channel_id": [channel.id, channel.name]}
+
+    def get_messages(self):
+        self._owned()
+        messages = self.env["odoo.ai.assistant.message"].search_read(
+            [("conversation_id", "=", self.id)],
+            ["role", "content", "local_only", "payload", "execution_steps", "create_date", "provider_sensitive"],
+            order="id desc", limit=MAX_LOADED_MESSAGES,
+        )
+        for message in messages:
+            if message["payload"] and message["payload"].get("kind") == "mcp_request":
+                request = self._tool_request(message["payload"]["request_id"])
+                message["payload"] = request._payload()
+            if message["role"] == "assistant" and not message["local_only"]:
+                message["content_html"] = format_reply(message["content"])
+        if messages:
+            self.sudo().write({"last_read_message_id": messages[0]["id"]})
+        latest_channel_message = self.channel_id.message_ids[:1]
+        if latest_channel_message:
+            self.channel_id.self_member_id._set_last_seen_message(latest_channel_message)
+        return list(reversed(messages))
+
+    def _topic_title(self, config):
+        if not self.title_pending:
+            return ""
+        prompts = self.env["odoo.ai.assistant.message"].search(
+            [("conversation_id", "=", self.id), ("role", "=", "user")], order="id", limit=MAX_TITLE_PROMPTS,
+        ).mapped("content")
+        if not prompts:
+            return ""
+        return config._client("title").conversation_title(config.model_id.identifier, prompts)
+
+    def _apply_title(self, title):
+        self.sudo().write({"name": title, "title_pending": False})
+        self.channel_id.sudo().write({"name": title})
+
+    def _lock_conversation(self, error_message):
+        self.env.cr.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", (CONVERSATION_LOCK_NAMESPACE, self.id))
+        result = self.env.cr.fetchone()
+        if not result or not result[0]:
+            raise UserError(error_message)
+
+    def send_message(self, content):
+        self._owned()
+        if not isinstance(content, str) or not content.strip() or len(content) > MAX_MESSAGE_CHARS:
+            raise ValidationError(_("Enter a message of 1 to %s characters.") % f"{MAX_MESSAGE_CHARS:,}")
+        self.channel_id.message_post(
+            body=escape(content.strip()), message_type="comment", subtype_xmlid="mail.mt_comment",
+        )
+        return self.get_messages()
+
+    def _store_answer(self, content, local_only=False, payload=None, execution_steps=None, provider_sensitive=False):
+        self.env["odoo.ai.assistant.message"].sudo().create({
+            "conversation_id": self.id, "role": "assistant",
+            "content": content, "local_only": local_only, "payload": payload,
+            "execution_steps": execution_steps, "provider_sensitive": provider_sensitive,
+        })
+        self.channel_id.with_context(odoo_ai_assistant_bot=_BOT_POST).message_post(
+            body=(Markup("<pre style='white-space:pre-wrap'>{}</pre>").format(content)
+                  if local_only else Markup(format_reply(content))),
+            author_id=self.env.ref("odoo_ai_assistant.ai_partner").id,
+            message_type="comment", subtype_xmlid="mail.mt_comment",
+        )
+
+    def _progress(self, label):
+        self.ensure_one()
+        # An independent transaction makes progress visible before the chat commits.
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, self.env.uid, {})
+            env.user.partner_id._bus_send("odoo_ai_progress", {
+                "conversation_id": self.id, "label": label,
+            })
+
+    def load_more_records(self, message_id):
+        self._owned()
+        if type(message_id) is not int or message_id <= 0:
+            raise ValidationError(_("Choose a valid record-list message."))
+        self._lock_conversation(_("This conversation is already being updated."))
+        message = self.env["odoo.ai.assistant.message"].search([
+            ("id", "=", message_id), ("conversation_id", "=", self.id), ("local_only", "=", True),
+        ])
+        payload = message.payload or {}
+        current = payload.get("table") if payload.get("kind") == "mcp_request" else None
+        if not current or not current.get("has_more"):
+            raise UserError(_("This message has no more record pages to load."))
+        request = self._tool_request(payload["request_id"])
+        request._validate_current(self)
+        if request.tool != "mcp_search_records":
+            raise ValidationError(_("Only a record search can load another page."))
+        arguments = dict(request.arguments or {})
+        arguments["offset"] = current["offset"] + len(current["rows"])
+        self._native_request(request.tool, {"arguments_json": json.dumps(arguments)})
+        return self.get_messages()
+
+    def _add_step(self, steps, label):
+        """Record an execution step and show it as live progress."""
+        steps.append(label)
+        self._progress(label)
+
+    def _native_request(self, name, arguments, steps=None):
+        request = self.env["odoo.ai.assistant.tool.request"]._prepare(
+            self.with_context(odoo_ai_provider_plan=True), name, arguments,
+        )
+        self._store_answer(
+            _("Review this action. No change will occur until you confirm. Business automation, notifications "
+              "and related-record changes may run when confirmed.") if request.mutation else
+            _("MCP result retrieved locally. Sharing with your external AI provider requires separate approval."),
+            local_only=True, payload=request._payload(), execution_steps=steps,
+        )
+        return request
+
+    def _tool_request(self, request_id):
+        self._owned()
+        if type(request_id) is not int or request_id <= 0:
+            raise ValidationError(_("Choose a valid native tool request."))
+        request = self.env["odoo.ai.assistant.tool.request"].sudo().browse(request_id).exists()
+        if not request or request.user_id.id != self.env.uid or request.conversation_id.id != self.id:
+            raise AccessError(_("This tool request belongs to another conversation or user."))
+        return request
+
+    def _update_tool_message(self, request):
+        for message in self.env["odoo.ai.assistant.message"].sudo().search([("conversation_id", "=", self.id)]):
+            if message.payload and message.payload.get("request_id") == request.id:
+                message.write({"payload": request._payload()})
+
+    def confirm_tool(self, request_id):
+        request = self._tool_request(request_id)
+        with self.env.cr.savepoint():
+            request._confirm(self)
+            self._update_tool_message(request)
+        return self.get_messages()
+
+    def cancel_tool(self, request_id):
+        request = self._tool_request(request_id)
+        self.env.cr.execute("SELECT id FROM odoo_ai_assistant_tool_request WHERE id = %s FOR UPDATE", (request.id,))
+        request.invalidate_recordset()
+        if request.state != "pending":
+            raise UserError(_("This tool request is no longer awaiting confirmation."))
+        request.write({"state": "cancelled"})
+        self._update_tool_message(request)
+        return self.get_messages()
+
+    def share_tool_result(self, request_id):
+        request = self._tool_request(request_id)
+        self._lock_conversation(_("An answer is already being generated for this conversation."))
+        self.env.cr.execute("SELECT id FROM odoo_ai_assistant_tool_request WHERE id = %s FOR UPDATE", (request.id,))
+        request.invalidate_recordset()
+        evidence, images = request._sharing_context(self)
+        config = self._check_enabled()
+        event = self.env["odoo.ai.assistant.tool.event"]._begin(request.tool, state="shared")
+        history = self._provider_history()
+        client = config._client("reply")
+        options = {"native_tools": True, "tool_context": evidence, "tool_images": images}
+        if config.screen_metadata:
+            options["screen_context"] = screen_context(self.env)
+        try:
+            tools = [tool for tool in available_tools(self.env) if tool["name"].startswith("mcp_")]
+            text, calls = client.reply(config.model_id.identifier, history, tools, **options)
+        except Exception:
+            self.env["odoo.ai.assistant.tool.event"]._finish(event, "failed")
+            raise
+        request.write({"state": "shared"})
+        self._update_tool_message(request)
+        if calls:
+            self._dispatch_calls(client, config, history, calls, [], allow_native_only=True)
+        else:
+            self._store_answer(text, provider_sensitive=True)
+        return self.get_messages()
+
+    def stage_upload(self, name, data, mimetype=None):
+        self._owned()
+        config = self._check_enabled()
+        if not (config.local_tools and config.native_actions):
+            raise AccessError(_("Enable confirmed business actions before staging files."))
+        if (not isinstance(name, str) or not name.strip() or len(name) > 255
+                or not isinstance(data, str) or len(data) > (MAX_UPLOAD_BYTES * 4 // 3 + 4)
+                or (mimetype is not None and (not isinstance(mimetype, str) or len(mimetype) > 120))):
+            raise ValidationError(_("Choose a named file within the MCP upload limit."))
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except ValueError as error:
+            raise ValidationError(_("The selected file is not valid base64.")) from error
+        if not raw or len(raw) > MAX_UPLOAD_BYTES:
+            raise ValidationError(_("The selected file is empty or exceeds the MCP upload limit."))
+        self.env["odoo.ai.assistant.tool.event"]._begin("stage_upload", state="done")
+        upload = self.env["odoo.ai.assistant.upload"].sudo().create({
+            "conversation_id": self.id, "user_id": self.env.uid, "name": name.strip(),
+            "data": data, "mimetype": mimetype, "size": len(raw),
+        })
+        self._store_answer(_("Staged locally: %(name)s (%(size)s bytes), reference upload:%(id)s. "
+                             "No business attachment has been created and no file content has been shared.") % {
+                                 "name": upload.name, "size": upload.size, "id": upload.id,
+                             }, local_only=True)
+        return {"reference": "upload:%s" % upload.id, "name": upload.name, "messages": self.get_messages()}
+
+    def _provider_history(self):
+        history = self.env["odoo.ai.assistant.message"].search(
+            [("conversation_id", "=", self.id)], order="id desc", limit=MAX_HISTORY_MESSAGES,
+        )
+        entries = [{
+            "role": message.role,
+            # A bracketed system note, so models do not echo it as their own reply.
+            "content": ("[System note, not a reply: an earlier request was completed and its result was "
+                        "shown to the user inside Odoo; the values are not shared with you. Answer the "
+                        "user's latest message; do not repeat this note or the earlier request.]"
+                        if message.local_only or message.provider_sensitive else message.content),
+        } for message in reversed(history)]
+        while entries and entries[0]["role"] != "user":
+            entries.pop(0)
+        # Bound history by both message count and text size. A count-only window
+        # can exceed smaller providers' context windows because prompts may be long.
+        bounded = []
+        used = 0
+        for entry in reversed(entries):
+            size = len(entry["content"])
+            if bounded and used + size > MAX_HISTORY_CHARS:
+                break
+            bounded.append(entry)
+            used += size
+        bounded.reverse()
+        while bounded and bounded[0]["role"] != "user":
+            bounded.pop(0)
+        return bounded
+
+    def _reply_to_message(self, message):
+        self._owned()
+        self._lock_conversation(_("An answer is already being generated for this conversation."))
+        content = html2plaintext(message.body).strip()
+        if not content or len(content) > MAX_MESSAGE_CHARS:
+            raise ValidationError(_("AI messages must contain 1 to %s characters of text.") % f"{MAX_MESSAGE_CHARS:,}")
+        config = self.env["odoo.ai.assistant.config"]._configuration()
+        if not config.model_id or not config.model_id.active:
+            raise UserError(_("Select an available model in AI Settings first."))
+        self.env["odoo.ai.assistant.message"].sudo().create({
+            "conversation_id": self.id, "role": "user", "content": content,
+        })
+        if ProviderClient.is_standalone_greeting(content):
+            self._progress(_("Responding to your greeting"))
+            text, calls = config._client("reply").reply(
+                config.model_id.identifier, [{"role": "user", "content": content}], [],
+                system_override=(
+                    "You are the Odoo assistant. Respond briefly and warmly to this standalone greeting "
+                    "and invite the user to ask about Odoo. Do not claim to have read records or performed "
+                    "actions. Assist exclusively with Odoo; refuse unrelated or mixed-topic requests."
+                ),
+            )
+            if calls or not text.strip():
+                raise UserError(_("The AI provider did not return a valid greeting. Please retry."))
+            self._store_answer(text, execution_steps=[_("Responding to your greeting")])
+            self.sudo().write({"write_date": fields.Datetime.now()})
+            return
+        history = self._provider_history()
+        tools = available_tools(self.env) if config.local_tools else []
+        steps = []
+        progress = partial(self._add_step, steps)
+        progress(_("Checking Odoo topic"))
+        classifier = config._client("scope")
+        if not classifier.is_odoo_topic(
+            config.model_id.identifier, history, app_names=accessible_apps(self.env),
+            vocabulary=accessible_menu_names(self.env),
+        ):
+            self._store_answer(_(SCOPE_REFUSAL), execution_steps=steps)
+            return
+        action_request = False
+        if config.local_tools:
+            progress(_("Determining whether you requested a business action"))
+            action_request = classifier.requires_action(config.model_id.identifier, history)
+            if action_request:
+                tools = self._action_tools(tools)
+            else:
+                tools = self._read_tools(tools)
+        progress(_("Selecting approved local tools"))
+        client = config._client("reply")
+        context_options = self._reply_context(config)
+        selected_view = requested_chart_tool(history, tools)
+        reply_tools = [selected_view] if selected_view else tools
+        try:
+            text, calls = client.reply(
+                config.model_id.identifier, history, reply_tools,
+                tool_choice=selected_view["name"] if selected_view else None, **context_options,
+            )
+        except ProviderError as error:
+            if not selected_view or error.kind != "tool_not_called":
+                raise
+            # The model ignored the chart instruction; let it choose freely among all tools once.
+            reply_tools = tools
+            text, calls = client.reply(config.model_id.identifier, history, tools, **context_options)
+        try:
+            title = self._topic_title(config)
+        except UserError:
+            # A title is cosmetic; never lose the answer because naming the chat failed.
+            _logger.info("AI conversation %s: automatic title skipped after an invalid provider result.", self.id)
+            title = ""
+        if calls:
+            self._dispatch_with_recovery(client, config, history, calls, steps, reply_tools,
+                                         context_options, action_request)
+        else:
+            self._store_answer(text, execution_steps=steps)
+        if title:
+            self._apply_title(title)
+        self.sudo().write({"write_date": fields.Datetime.now()})
+
+    def _reply_context(self, config, request=None, action_schema=False):
+        context = screen_context(self.env) if config.screen_metadata else {}
+        if config.local_tools:
+            context["calendar"] = {
+                "today": fields.Date.to_string(fields.Date.context_today(self)),
+                "timezone": self.env.user.tz or "UTC",
+            }
+            metadata = self.env["odoo.ai.assistant.native.mcp"]._planning_context(request, all_fields=action_schema)
+            if metadata is not None:
+                context["native_schema"] = metadata
+        options = {"screen_context": context} if context else {}
+        if config.local_tools:
+            options["native_tools"] = True
+        return options
+
+    def _store_explanation(self, client, config, history, context, steps):
+        """Ask the provider to explain screen metadata (no tools) and store the answer."""
+        explanation, extra_calls = client.reply(config.model_id.identifier, history, [], screen_context=context)
+        if extra_calls or not explanation.strip():
+            raise UserError(_("The AI provider did not return an explanation. Please retry."))
+        self._store_answer(explanation, execution_steps=list(steps))
+
+    def _field_hint(self, reason):
+        """For an invented field (Odoo: "Invalid field <model>.<field>"), list the model's real field names."""
+        match = re.search(r"Invalid field ([a-z0-9_.]+)\.([a-z0-9_]+)", reason)
+        model = match and match.group(1)
+        if not model or is_restricted_model(self.env, model) or not self.env[model].has_access("read"):
+            return ""
+        names = sorted(name for name in self.env[model].fields_get(attributes=["type"])
+                       if not re.search(r"password|token|secret|api_?key|credential", name))
+        return " Fields available on %s: %s." % (model, ", ".join(names[:150]))
+
+    def _read_tools(self, tools):
+        """Tools for a question: everything except native tools that change data."""
+        catalogue = self.env["odoo.ai.assistant.native.mcp"]._catalogue()
+        return [tool for tool in tools if not (tool["name"] in catalogue and catalogue[tool["name"]]["mutation"])]
+
+    def _try_dispatch(self, client, config, history, calls, steps, action_request):
+        """Run tool calls in a savepoint. Return why Odoo refused them, or None when they ran."""
+        try:
+            with self.env.cr.savepoint():
+                self._dispatch_calls(client, config, history, calls, steps, action_request=action_request)
+        except ProviderError:
+            raise
+        # ValueError covers Odoo domain errors such as an invented field name.
+        except (AccessError, ValidationError, UserError, ValueError) as error:
+            return str(error.args[0]) if error.args else str(error)
+        return None
+
+    def _dispatch_with_recovery(self, client, config, history, calls, steps, tools, options, action_request):
+        """Run the provider's tool calls. If Odoo refuses or rejects a call, tell the provider once
+        so it can choose another tool; if that also fails, answer with the reason instead of an error."""
+        reason = self._try_dispatch(client, config, history, calls, steps, action_request)
+        if reason is None:
+            return
+        self._progress(_("Choosing another approach after: %s") % reason)
+        latest = history[-1]
+        retry_history = history[:-1] + [dict(latest, content=latest["content"] + (
+            "\n\n[Odoo note: the tool call you chose could not run: %s.%s Choose a different available tool "
+            "that fits, or answer without tools. Do not repeat the same call.]" % (reason, self._field_hint(reason))
+        ))]
+        text, retry_calls = client.reply(config.model_id.identifier, retry_history, tools, **options)
+        if retry_calls:
+            reason = self._try_dispatch(client, config, retry_history, retry_calls, steps, action_request)
+            if reason is None:
+                return
+        elif text.strip():
+            self._store_answer(text, execution_steps=steps)
+            return
+        self._store_answer(_("I couldn't complete this request in Odoo: %s") % reason,
+                           local_only=True, execution_steps=steps)
+
+    def _action_tools(self, tools):
+        """Tools for an action: only native tools that change data. The native request validates
+        the target and stages a preview, so no schema discovery is needed first."""
+        catalogue = self.env["odoo.ai.assistant.native.mcp"]._catalogue()
+        return [tool for tool in tools if tool["name"] in catalogue
+                and catalogue[tool["name"]]["mutation"]]
+
+    def _dispatch_calls(self, client, config, history, calls, steps, allow_native_only=False, discovery_depth=0,
+                        action_request=False):
+        tools = available_tools(self.env) if config.local_tools else []
+        if action_request:
+            tools = self._action_tools(tools)
+        discovery = []
+        terminal_result = False
+        progress = partial(self._add_step, steps)
+        if len(calls) > 5:
+            raise UserError(_("The provider requested too many tools. Ask a narrower question."))
+        if calls:
+            if not config.local_tools:
+                raise AccessError(_("The provider requested a tool while local tools are disabled."))
+            for call in calls:
+                if not isinstance(call.get("name"), str) or call["name"] not in {tool["name"] for tool in tools}:
+                    raise AccessError(_("The provider requested a tool unavailable to your user."))
+                arguments = parse_tool_arguments(call["arguments"])
+                if call["name"].startswith("mcp_"):
+                    progress(_("Preparing confirmed MCP action") if self.env[
+                        "odoo.ai.assistant.native.mcp"
+                    ]._catalogue()[call["name"]]["mutation"] else _("Executing native MCP read"))
+                    if call["name"] in {"mcp_list_models", "mcp_get_fields"}:
+                        request = self.env["odoo.ai.assistant.tool.request"]._prepare(self, call["name"], arguments)
+                        discovery.append(self._reply_context(config, request, action_schema=action_request)[
+                            "screen_context"
+                        ]["native_schema"])
+                    else:
+                        self._native_request(call["name"], arguments, list(steps))
+                        terminal_result = True
+                elif allow_native_only:
+                    raise UserError(_("Use a native MCP tool when continuing an approved shared result."))
+                elif call["name"] == "odoo_screen_details":
+                    terminal_result = True
+                    progress(_("Inspecting permitted fields in the requested Odoo screen"))
+                    details = screen_details(self.env, arguments)
+                    context = screen_context(self.env, arguments["app"])
+                    context["screen_details"] = details
+                    progress(_("Explaining the screen fields"))
+                    self._store_explanation(client, config, history, context, steps)
+                elif call["name"] == "odoo_app_structure":
+                    terminal_result = True
+                    progress(_("Inspecting accessible Odoo app menus"))
+                    payload = app_structure(self.env, arguments)
+                    if config.screen_metadata:
+                        progress(_("Explaining the requested Odoo screens"))
+                        self._store_explanation(
+                            client, config, history, screen_context(self.env, arguments["app"]), steps,
+                        )
+                    else:
+                        self._store_answer(
+                            _("These are the app screens available to your user. To see their records, "
+                              "an administrator must allow the AI to use that Odoo data in AI Settings."),
+                            local_only=True, payload=payload, execution_steps=list(steps),
+                        )
+                elif call["name"] == CHART_TOOL:
+                    terminal_result = True
+                    progress(_("Grouping the records and drawing the chart locally"))
+                    payload = execute_chart(self.env, arguments)
+                    self._store_answer(_("Local Odoo chart: %s") % payload["title"],
+                                       local_only=True, payload=payload, execution_steps=list(steps))
+                else:
+                    terminal_result = True
+                    progress(_("Reading running Odoo instance information") if call["name"] == "odoo_instance_info"
+                             else _("Executing approved local MCP query"))
+                    result = execute_tool(self.env, call["name"], arguments)
+                    if call["name"] == "odoo_instance_info" and config.screen_metadata:
+                        progress(_("Explaining Odoo version information"))
+                        self._store_explanation(client, config, history, screen_context(self.env), steps)
+                    else:
+                        self._store_answer(
+                            _("Local Odoo results (not sent to any AI provider):\n%s") % result,
+                            local_only=True, execution_steps=list(steps),
+                        )
+        if discovery and not terminal_result:
+            if discovery_depth >= 3:
+                raise UserError(_("The AI kept discovering schemas without completing your query. "
+                                  "Please retry with a narrower request."))
+            progress(_("Using discovered fields to complete your request"))
+            options = self._reply_context(config)
+            options["screen_context"]["discovered_schemas"] = discovery
+            next_tools = [tool for tool in tools if not allow_native_only or tool["name"].startswith("mcp_")]
+            text, next_calls = client.reply(config.model_id.identifier, history, next_tools, **options)
+            if next_calls:
+                self._dispatch_calls(client, config, history, next_calls, steps,
+                                     allow_native_only=allow_native_only, discovery_depth=discovery_depth + 1,
+                                     action_request=action_request)
+            elif text.strip():
+                self._store_answer(text, execution_steps=list(steps))
+            else:
+                raise UserError(_("The AI did not complete your query after schema discovery. Please retry."))
+
+    def unlink(self):
+        for conversation in self:
+            conversation._owned()
+        channels = self.channel_id
+        result = super().unlink()
+        channels.sudo().unlink()
+        return result
+
+
+class AIMessage(models.Model):
+    _name = "odoo.ai.assistant.message"
+    _description = "AI Conversation Message"
+    _order = "id"
+
+    conversation_id = fields.Many2one("odoo.ai.assistant.conversation", required=True, ondelete="cascade", index=True)
+    role = fields.Selection([("user", "User"), ("assistant", "Assistant")], required=True)
+    content = fields.Text(required=True)
+    local_only = fields.Boolean(default=False)
+    payload = fields.Json()
+    execution_steps = fields.Json()
+    provider_sensitive = fields.Boolean(default=False)
