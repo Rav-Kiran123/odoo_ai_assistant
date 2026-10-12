@@ -1,2 +1,0 @@
-markdown2>=2.5.4,<3
-jsonschema>=4.23,<5
