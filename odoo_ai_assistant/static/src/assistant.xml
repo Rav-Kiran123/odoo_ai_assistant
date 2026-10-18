@@ -3,13 +3,13 @@
     <t t-name="odoo_ai_assistant.Systray">
         <div t-if="state.enabled" class="o_ai_systray">
             <!-- Drawn like Odoo's own systray icons, so it takes the navbar's colours in any theme. -->
-            <button class="o_nav_entry btn border-0" title="Ask AI" aria-label="Open AI Assistant" t-on-click="() => ai.open()">
+            <button class="o_nav_entry btn border-0" title="Ask AI" aria-label="Open AI Agent" t-on-click="() => ai.open()">
                 <i class="fa fa-lg fa-magic" role="img" aria-label="AI magic wand"/>
             </button>
         </div>
     </t>
     <t t-name="odoo_ai_assistant.Overlay">
-        <div t-if="state.open" class="o_ai_popup shadow-lg" t-att-class="{'o_ai_minimized': state.minimized}" t-att-style="size.width &amp;&amp; !state.minimized ? 'width:' + size.width + 'px;height:' + size.height + 'px' : ''" role="dialog" aria-label="AI Assistant" t-on-keydown="keydown">
+        <div t-if="state.open" class="o_ai_popup shadow-lg" t-att-class="{'o_ai_minimized': state.minimized}" t-att-style="size.width &amp;&amp; !state.minimized ? 'width:' + size.width + 'px;height:' + size.height + 'px' : ''" role="dialog" aria-label="AI Agent" t-on-keydown="keydown">
             <AssistantPanel/>
             <div t-if="!state.minimized" class="o_ai_resize_handle" title="Drag to resize chat" aria-label="Resize chat" t-on-pointerdown="startResize" t-on-pointermove="resize" t-on-pointerup="stopResize" t-on-pointercancel="stopResize"><i class="fa fa-expand"/></div>
         </div>
@@ -51,8 +51,8 @@
                 <button class="btn btn-link ms-auto p-0" title="Dismiss" aria-label="Dismiss resume previous chat" t-on-click="() => state.showResume = false"><i class="fa fa-times"/></button>
             </div>
             <div t-if="!state.enabled" class="p-4">
-                <h4>AI Assistant is not enabled</h4>
-                <p class="text-muted">Ask your administrator to enable AI Settings and grant AI Assistant access on your user.</p>
+                <h4>AI Agent is not enabled</h4>
+                <p class="text-muted">Ask your administrator to enable AI Settings and grant AI Agent access on your user.</p>
             </div>
             <div t-elif="!state.minimized || props.full" class="o_ai_workspace d-flex flex-grow-1 overflow-hidden">
                 <aside t-if="props.full" class="o_ai_history border-end d-flex flex-column">
@@ -92,12 +92,12 @@
                     <header t-if="props.full" class="o_ai_thread_header d-flex align-items-center gap-2 px-3 py-2 border-bottom flex-shrink-0">
                         <img src="/odoo_ai_assistant/static/description/icon.svg" alt="" width="28" height="28"/>
                         <strong class="text-truncate flex-grow-1" t-esc="state.current?.name || state.assistant_name"/>
-                        <span t-if="state.can_change_model" class="o_ai_model_select" title="AI model in AI Settings, used for every user">
-                            <SelectMenu choices="modelChoices" value="state.model_id" searchable="true" required="true"
+                        <span t-if="state.can_change_model" class="o_ai_model_select" title="AI model for this conversation only; new conversations use the AI Settings model">
+                            <SelectMenu choices="modelChoices" value="currentModel.value" searchable="true" required="true"
                                         disabled="state.busy" onOpened.bind="loadModelChoices" onSelect.bind="selectModel"
                                         togglerClass="'btn btn-sm btn-light text-muted'" searchPlaceholder.translate="Search models"/>
                         </span>
-                        <small t-else="" class="text-muted text-truncate" t-esc="state.model"/>
+                        <small t-else="" class="text-muted text-truncate" t-esc="currentModel.label"/>
                     </header>
                     <div class="o_ai_messages flex-grow-1 overflow-auto p-3" t-att-class="{'o_ai_messages_empty': !state.messages.length}" t-ref="messages" t-on-scroll="onMessagesScroll" aria-live="polite" t-att-aria-busy="busy ? 'true' : 'false'">
                         <div t-if="!state.messages.length" class="o_ai_welcome">

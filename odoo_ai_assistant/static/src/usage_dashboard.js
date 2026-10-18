@@ -1,7 +1,5 @@
 import { Component, onWillStart, onWillUnmount, useEffect, useRef, useState } from "@odoo/owl";
 import { loadBundle } from "@web/core/assets";
-import { cookie } from "@web/core/browser/cookie";
-import { getColor } from "@web/core/colors/colors";
 import { registry } from "@web/core/registry";
 import { useService } from "@web/core/utils/hooks";
 import { _t } from "@web/core/l10n/translation";
@@ -14,11 +12,19 @@ const PERIODS = [
     { key: "all", label: _t("All time") },
 ];
 
-const colorScheme = cookie.get("color_scheme");
+// Chart metrics; their bars are drawn in the theme's colours (Bootstrap's CSS variables).
 const METRICS = {
-    tokens: { label: _t("Tokens"), color: getColor(0, colorScheme, 2) },
-    calls: { label: _t("API calls"), color: getColor(1, colorScheme, 2) },
+    cost: { label: _t("Cost"), color: "--primary" },
+    tokens: { label: _t("Tokens"), color: "--info" },
+    calls: { label: _t("API calls"), color: "--success" },
 };
+
+/** A light tint of any CSS colour: the browser normalises it to rgb(), then a quarter of its opacity is kept. */
+function translucent(color) {
+    const probe = new Option().style;
+    probe.color = color;
+    return probe.color.replace(/rgba?\(([^,]+),([^,]+),([^,)]+)[^)]*\)/, "rgba($1,$2,$3,0.25)");
+}
 
 export class UsageDashboard extends Component {
     static template = "odoo_ai_assistant.UsageDashboard";
@@ -29,7 +35,7 @@ export class UsageDashboard extends Component {
         this.action = useService("action");
         this.periods = PERIODS;
         this.metrics = METRICS;
-        this.state = useState({ period: "30d", metric: "tokens", breakdown: "by_model", data: null, loading: true });
+        this.state = useState({ period: "30d", metric: "cost", breakdown: "by_user", data: null, loading: true });
         this.canvasRef = useRef("chart");
         this.chart = null;
         onWillStart(async () => {
@@ -63,6 +69,8 @@ export class UsageDashboard extends Component {
             return;
         }
         const metric = METRICS[this.state.metric];
+        const color = getComputedStyle(canvas).getPropertyValue(metric.color).trim();
+        const format = (value) => this.formatMetric(this.state.metric, value);
         this.chart = new Chart(canvas, {
             type: "bar",
             data: {
@@ -70,8 +78,14 @@ export class UsageDashboard extends Component {
                 datasets: [{
                     label: metric.label,
                     data: daily.map((day) => day[this.state.metric]),
-                    backgroundColor: metric.color,
-                    borderRadius: 4,
+                    // Fades from the theme colour at the top of each bar to a light tint at its base.
+                    backgroundColor: ({ chart }) => {
+                        const gradient = chart.ctx.createLinearGradient(0, chart.chartArea?.top || 0, 0, chart.chartArea?.bottom || 1);
+                        gradient.addColorStop(0, color);
+                        gradient.addColorStop(1, translucent(color));
+                        return gradient;
+                    },
+                    borderRadius: 6,
                     maxBarThickness: 28,
                 }],
             },
@@ -80,11 +94,11 @@ export class UsageDashboard extends Component {
                 devicePixelRatio: chartPixelRatio(),
                 plugins: {
                     legend: { display: false },
-                    tooltip: { callbacks: { label: (item) => `${metric.label}: ${this.formatNumber(item.raw)}` } },
+                    tooltip: { callbacks: { label: (item) => `${metric.label}: ${format(item.raw)}` } },
                 },
                 scales: {
                     x: { grid: { display: false }, ticks: { autoSkip: true, maxRotation: 0 } },
-                    y: { beginAtZero: true, ticks: { callback: (value) => this.formatNumber(value) } },
+                    y: { beginAtZero: true, ticks: { callback: (value) => format(value) } },
                 },
             },
         });
@@ -96,6 +110,19 @@ export class UsageDashboard extends Component {
 
     formatNumber(value) {
         return new Intl.NumberFormat([], { notation: value >= 100000 ? "compact" : "standard" }).format(value || 0);
+    }
+
+    /** US dollars with Odoo's USD symbol and position; small amounts keep enough decimals to be seen. */
+    formatMoney(value) {
+        const amount = new Intl.NumberFormat([], {
+            minimumFractionDigits: 2, maximumFractionDigits: Math.abs(value || 0) < 1 ? 4 : 2,
+        }).format(value || 0);
+        const { symbol, position } = this.state.data.currency;
+        return position === "after" ? `${amount} ${symbol}` : `${symbol}${amount}`;
+    }
+
+    formatMetric(metric, value) {
+        return metric === "cost" ? this.formatMoney(value) : this.formatNumber(value);
     }
 
     change(key) {
@@ -111,14 +138,34 @@ export class UsageDashboard extends Component {
     get cards() {
         const totals = this.state.data.totals;
         return [
-            { key: "tokens", label: _t("Tokens"), value: this.formatNumber(totals.tokens),
+            { key: "cost", label: _t("Total cost"), icon: "fa-dollar", value: this.formatMoney(totals.cost),
+              detail: totals.answers ? _t("%s per answer", this.formatMoney(totals.cost / totals.answers)) : _t("No answers yet") },
+            { key: "answers", label: _t("Answers"), icon: "fa-magic", value: this.formatNumber(totals.answers),
+              detail: _t("%s failed calls", this.formatNumber(totals.failed_calls)) },
+            { key: "tokens", label: _t("Tokens"), icon: "fa-bolt", value: this.formatNumber(totals.tokens),
               detail: _t("%(input)s in · %(output)s out", {
                   input: this.formatNumber(totals.input_tokens), output: this.formatNumber(totals.output_tokens),
               }) },
-            { key: "calls", label: _t("API calls"), value: this.formatNumber(totals.calls),
-              detail: _t("%s failed", this.formatNumber(totals.failed_calls)) },
-            { key: "active_users", label: _t("Active users"), value: this.formatNumber(totals.active_users),
-              detail: _t("Users who made requests") },
+            { key: "active_users", label: _t("Active users"), icon: "fa-users", value: this.formatNumber(totals.active_users),
+              detail: _t("Users who asked the AI") },
+        ];
+    }
+
+    /** Who gets answers with the fewest tokens, and who costs the most, among this period's users. */
+    get highlights() {
+        const users = (this.state.data?.by_user || []).filter((row) => row.person && row.answers);
+        if (!users.length) {
+            return [];
+        }
+        const efficient = users.reduce((best, row) => (row.tokens / row.answers < best.tokens / best.answers ? row : best));
+        const spender = users.reduce((top, row) => (row.cost > top.cost ? row : top));
+        return [
+            { key: "efficient", icon: "fa-trophy", title: _t("Most efficient user"), name: efficient.label,
+              detail: _t("%s tokens per answer", this.formatNumber(Math.round(efficient.tokens / efficient.answers))) },
+            { key: "spender", icon: "fa-line-chart", title: _t("Highest spend"), name: spender.label,
+              detail: _t("%(cost)s for %(answers)s answers", {
+                  cost: this.formatMoney(spender.cost), answers: this.formatNumber(spender.answers),
+              }) },
         ];
     }
 
@@ -129,8 +176,8 @@ export class UsageDashboard extends Component {
 
     get breakdowns() {
         return [
-            ["by_model", _t("Model")], ["by_provider", _t("Provider")],
-            ["by_user", _t("User")], ["by_purpose", _t("Request type")],
+            ["by_user", _t("User")], ["by_model", _t("Model")],
+            ["by_provider", _t("Provider")], ["by_purpose", _t("Request type")],
         ];
     }
 
@@ -138,10 +185,11 @@ export class UsageDashboard extends Component {
         return this.state.data?.[this.state.breakdown] || [];
     }
 
+    /** A row's share of the period's cost, or of its tokens when no cost is known. */
     share(row) {
         const totals = this.state.data.totals;
-        const base = totals.tokens > 0 ? row.tokens / totals.tokens : totals.calls > 0 ? row.calls / totals.calls : 0;
-        return Math.round(base * 100);
+        const [part, whole] = totals.cost > 0 ? [row.cost, totals.cost] : [row.tokens, totals.tokens];
+        return whole > 0 ? Math.round((part / whole) * 100) : 0;
     }
 
     openLog() {

@@ -1,12 +1,15 @@
+import ast
+import importlib.util
 import re
 
 from lxml import etree
 
 from odoo import _, release
 from odoo.exceptions import AccessError, ValidationError
+from odoo.tools.safe_eval import safe_eval
 
 from .limits import (
-    CREDENTIAL_FIELD, MAX_CONTEXT_SCREENS, MAX_FIELD_SUGGESTIONS, MAX_LOOKUP_NAME_CHARS, MAX_SCREEN_BUTTONS,
+    CREDENTIAL_FIELD, CURRENT_USER, MAX_CONTEXT_SCREENS, MAX_FIELD_SUGGESTIONS, MAX_LOOKUP_NAME_CHARS, MAX_SCREEN_BUTTONS,
     MAX_SCREEN_FIELDS, MAX_SCREEN_MATCHES, is_restricted_model,
 )
 from .providers import _vocabulary_pattern
@@ -15,6 +18,41 @@ from .providers import _vocabulary_pattern
 # sizes are left out so every preview in the chat has the same size.
 _BUTTON_STYLE = re.compile(r"btn(?:-(?!sm$|lg$)[a-z-]+)?|oe_highlight|oe_link")
 _TRUE = {"1", "True", "true"}
+# A dotted lowercase name such as sale.order, outside links, e-mail addresses and file paths.
+_MODEL_LIKE = re.compile(r"(?<![\w./@:-])[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+(?![\w/@-]|\.\w)")
+
+
+def button_label(node):
+    """A view button's label as the screen shows it."""
+    return node.get("string") or " ".join("".join(node.itertext()).split())
+
+
+def eval_view_expression(expression, record, extra=None):
+    """Evaluate a view expression (an invisible condition, a button's context) on ``record``'s values as Odoo's web
+    client does: a link is its ID, a list of links their IDs."""
+    names = {node.id for node in ast.walk(ast.parse(expression, mode="eval")) if isinstance(node, ast.Name)}
+    values = {}
+    for name in names & set(record._fields):
+        value = record[name]
+        values[name] = (value.ids if record._fields[name].type in {"one2many", "many2many"} else value.id
+                        ) if record._fields[name].relational else value
+    return safe_eval(expression, {**values, "id": record.id, "uid": record.env.uid,
+                                  "context": dict(record.env.context), **(extra or {})})
+
+
+def visible_for(node, record):
+    """Whether ``node`` of ``record``'s view shows for that record: its and its parents' invisible conditions are
+    evaluated on the record. A condition that cannot be evaluated (one about a parent form) hides it."""
+    for element in [node, *node.iterancestors()]:
+        condition = (element.get("invisible") or "").strip()
+        if condition in {"", "0", "False", "false"}:
+            continue
+        try:
+            if condition in _TRUE or eval_view_expression(condition, record):
+                return False
+        except Exception:  # noqa: BLE001 - any name or construct the record cannot answer hides the button
+            return False
+    return True
 
 
 def _visibility(node):
@@ -48,6 +86,50 @@ def apps_named_in(env, text):
             named.add(menu_id)
         previous_end = end
     return [menu_id for menu_id in apps if menu_id in named]
+
+
+def menus_named_in(env, text):
+    """The accessible menus inside apps that ``text`` names, singular or plural, with their full path and the model
+    of their records, so the AI knows where a named screen is and what it holds without searching every app's
+    menus. A word that names an app means the app (see apps_named_in), not a menu of the same name; the longest,
+    most specific names come first."""
+    apps = accessible_apps(env)
+    app_names = {name.casefold() for name in apps}
+    rows = {row["menu"]: row for app in apps for row in app_structure(env, {"app": app})["rows"]}
+    named = [row for path, row in rows.items() if " / " in path
+             and (name := path.rsplit(" / ", 1)[1]).casefold() not in app_names
+             and (pattern := _vocabulary_pattern([name])) and pattern.search(text)]
+    named.sort(key=lambda row: -len(row["menu"].rsplit(" / ", 1)[1]))
+    return [{"path": row["menu"], **({"model": row["model"]} if row["model"] else {})}
+            for row in named[:MAX_SCREEN_MATCHES]]
+
+
+def filters_named_in(env, text, models):
+    """Odoo's own search filters of ``models`` (label, model and search) whose label starts with a word ``text``
+    uses ("overdue" names Overdue Opportunities, not every Opportunities filter), so the AI searches the way Odoo's
+    screens do instead of guessing a meaning. uid becomes the AI's placeholder for the signed-in user."""
+    found = []
+    for model in models:
+        for node in etree.fromstring(env[model].get_view(view_type="search")["arch"]).iter("filter"):
+            label, domain = node.get("string") or "", node.get("domain") or ""
+            first = next((word for word in label.split() if len(word) >= 3), "")
+            if domain.strip() not in {"", "[]"} and (pattern := _vocabulary_pattern([first])) and pattern.search(text):
+                found.append({"model": model, "filter": label,
+                              "domain": re.sub(r"\buid\b", repr(CURRENT_USER), " ".join(domain.split()))})
+    return found[:MAX_SCREEN_MATCHES]
+
+
+def unknown_model_names(env, text):
+    """Names in ``text`` written like a model of this database (their first part starts a real model's name, as
+    sale in sale.order) that are not one, nor a record's XML ID or a Python module: an answer must not present a
+    guessed model as real."""
+    prefixes = {model.split(".", 1)[0] for model in env}
+    data = env["ir.model.data"].sudo()
+    return list(dict.fromkeys(
+        name for name in _MODEL_LIKE.findall(text)
+        if name.split(".", 1)[0] in prefixes and name not in env
+        and not importlib.util.find_spec(name.split(".", 1)[0])
+        and not data._xmlid_to_res_id(name, raise_if_not_found=False)))
 
 
 def apps_using_models(env, models):
@@ -261,13 +343,16 @@ def _inspect_screen(env, menu, path):
             seen[name] = field
             screen["fields"].append(field)
         for node in arch.xpath(".//button | .//a[contains(concat(' ', normalize-space(@class), ' '), ' btn ')]"):
-            label = node.get("string") or " ".join("".join(node.itertext()).split())
+            label = button_label(node)
             visibility = _visibility(node)
             if not label or visibility == "hidden":
                 continue
-            classes = " ".join(cls for cls in (node.get("class") or "").split() if _BUTTON_STYLE.fullmatch(cls))
-            if not classes and view_type == "list":
+            styles = [cls for cls in (node.get("class") or "").split() if _BUTTON_STYLE.fullmatch(cls)]
+            if not styles and view_type == "list":
                 continue  # unstyled list buttons are row links; elsewhere ViewButton's default style applies
+            # ViewButton adds "btn" itself, so beside another style it changes nothing: "btn btn-primary" and
+            # "btn-primary" are one look.
+            classes = " ".join(cls for cls in styles if cls != "btn" or len(styles) == 1)
             icon = node.get("icon") or ""
             look = {"classes": classes, "icon": icon if icon.startswith(("fa-", "oi-")) else ""}
             # One entry per label: a button such as Confirm can be highlighted in one state and plain in another.

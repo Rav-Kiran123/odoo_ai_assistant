@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING
 
 from jsonschema.validators import validator_for
 from jsonschema.exceptions import SchemaError, ValidationError as SchemaValidationError
+from lxml import etree
 
 from odoo import api, fields, models, _
 from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.service.model import get_public_method
 from odoo.tools import SQL, config as server_config, formatLang, html2plaintext
 from odoo.tools.image import image_process
 from odoo.tools.mimetypes import guess_mimetype
@@ -36,9 +38,11 @@ else:
         MAX_UPLOAD_BYTES as MAX_UPLOAD_BYTES, _BLOCKED_METHOD_CALLS, _METHOD_CALL_BLOCKED_MODELS, _json_safe,
     )
 
-from .tools import cell_value
+from .tools import cell_value, data_access_menus
+from .navigation import button_label, eval_view_expression, visible_for
+from .providers import _vocabulary_pattern
 from .limits import (
-    CREDENTIAL_FIELD, MAX_ATTACHMENT_TEXT_CHARS, MAX_AUDIT_TOOL_NAME_CHARS, MAX_IMAGE_CHARS, MAX_LINE_FIELD_EXAMPLES,
+    CREDENTIAL_FIELD, CURRENT_USER, MAX_ATTACHMENT_TEXT_CHARS, MAX_FIELD_SUGGESTIONS, MAX_AUDIT_TOOL_NAME_CHARS, MAX_IMAGE_CHARS, MAX_LINE_FIELD_EXAMPLES,
     MAX_PLAN_DEPTH, MAX_RECORD_MESSAGES, MAX_REFERENCE_TERMS, MAX_SUMMARY_NAMES, MAX_REQUEST_DETAIL_CHARS, MAX_SCHEMA_ERROR_CHARS, MAX_SHARED_EVIDENCE_CHARS,
     MAX_SHARED_IMAGES, MAX_TOOL_ARGUMENT_CHARS, NATIVE_RATE_LOCK_NAMESPACE, STAGED_FILE_LIFETIME,
     TOOL_REQUEST_LIFETIME, is_restricted_model,
@@ -67,10 +71,13 @@ _BUILTINS = {
     "read_attachment", "list_record_attachments", "list_resource_templates", "get_current_context",
     "create_record", "create_records", "update_record", "update_records", "delete_record",
     "call_model_method", "upload_attachment", "post_message", "list_record_messages", "rate_sales_executives",
+    "press_button",
 }
 _IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 # Native MCP tools are offered to the AI provider as mcp_<tool name>.
 NATIVE_TOOL_PREFIX = "mcp_"
+# Pressing a screen button may create or change anything, so it is offered with every kind of change request.
+PRESS_TOOL = NATIVE_TOOL_PREFIX + "press_button"
 _lt = LazyTranslate(__name__)
 # What a confirmed change shows, by its tool's MCP operation tag (other actions: "Successfully completed").
 _CHANGE_DONE = {"create": _lt("Successfully created"), "write": _lt("Successfully updated"),
@@ -140,6 +147,28 @@ def _pdf_text_rows(data):
     return "\n\n".join(page for page in pages if page)
 
 
+def _option_key(field, text):
+    """Selection key for ``text``: the key itself, or the one option whose label matches (any case)."""
+    text = text.strip().strip(",.;:").strip()
+    options = field.get("selection") or []
+    if text in [key for key, _label in options]:
+        return text
+    keys = [key for key, label in options if str(label).strip().casefold() == text.casefold()]
+    return keys[0] if len(keys) == 1 else None
+
+
+def _check_settable(name, field):
+    """Refuse a value Odoo derives and users cannot edit (an Amount, an Invoiced quantity): it is never set directly.
+    ``field`` is the fields_get description, with its string, readonly, related and depends."""
+    if field.get("readonly") and field.get("related"):
+        source = field["related"].split(".")[0] if isinstance(field["related"], str) else field["related"][0]
+        raise ValidationError(_("'%(field)s' is derived from '%(source)s' and cannot be set directly. "
+                                "Set '%(source)s' instead.") % {"field": name, "source": source})
+    if field.get("readonly") and field.get("depends"):
+        raise ValidationError(_("'%(label)s' is calculated by Odoo, so it cannot be set directly. Change the "
+                                "values it is calculated from instead.") % {"label": field["string"]})
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
 
@@ -178,6 +207,11 @@ def _check_schema(schema, arguments):
         }) from error
 
 
+class DirectReply(UserError):
+    """An outcome the chat states as its answer instead of asking the AI to try another tool: a permission only an
+    administrator can grant (or never can), or a value only the user can give."""
+
+
 class NativeMCP(models.AbstractModel):
     _name = "odoo.ai.assistant.native.mcp"
     _inherit = "mcp.mixin"
@@ -203,21 +237,36 @@ class NativeMCP(models.AbstractModel):
     def _allowed_model(self, model):
         return not is_restricted_model(self.env, model, allowed=_NATIVE_ALLOWED_MODELS)
 
-    def _resolve_model(self, model):
-        self._access()
+    def _refusal(self, model, operation="read"):
+        """Why the AI may not use ``model`` for ``operation`` (read, create, write, unlink or method_calls), in plain
+        words: the model with its technical name and the MCP Server checkbox an administrator ticks, or why the
+        model is never available."""
+        if not isinstance(model, str) or model not in self.env:
+            return DirectReply(_("This Odoo has no %s records: the app they belong to is not installed.") % model)
+        label = "%s (%s)" % (self.env["ir.model"].sudo()._get(model).name, model)
         if not self._allowed_model(model):
-            raise AccessError(_("Choose an enabled business model, not a technical or credential model."))
-        if not self.env["mcp.enabled.model"].sudo().is_model_enabled(model):
-            raise AccessError(_("Model '%s' is not enabled for MCP.") % model)
+            return DirectReply(_("The AI cannot use %s records: Odoo keeps technical, security and settings "
+                                       "data away from the AI.") % label)
+        gates = self.env["mcp.enabled.model"]
+        values = {"label": label, "menu": data_access_menus(self.env, settings=False),
+                  "checkbox": gates.fields_get(["allow_" + operation], ["string"])["allow_" + operation]["string"]}
+        if not gates.sudo().is_model_enabled(model):
+            return DirectReply(_("The AI cannot do this yet: %(label)s is not in %(menu)s. An administrator "
+                                       "can add it there and tick %(checkbox)s.") % values)
+        return DirectReply(_("The AI cannot do this yet: in %(menu)s, %(label)s does not have %(checkbox)s "
+                                   "ticked. An administrator can tick it there.") % values)
+
+    def _resolve_model(self, model, operation="read"):
+        self._access()
+        if not self._allowed_model(model) or not self.env["mcp.enabled.model"].sudo().is_model_enabled(model):
+            raise self._refusal(model, operation)
         return self.env[model]
 
     def _check_op(self, model, operation):
-        recordset = self._resolve_model(model)
+        recordset = self._resolve_model(model, operation)
         self._access(mutation=operation != "read")
         if not self.env["mcp.enabled.model"].sudo().check_model_operation_enabled(model, operation):
-            raise AccessError(_("MCP does not permit %(operation)s on %(model)s.") % {
-                "operation": operation, "model": model,
-            })
+            raise self._refusal(model, operation)
         recordset.check_access(operation)
         return recordset
 
@@ -569,8 +618,12 @@ class NativeMCP(models.AbstractModel):
             for key, label, target, weight, lower, show in measures:
                 target = targets.get(key, target)
                 value = values[key]
-                cells[key] = "–" if value is None else (
-                    _("%(value)s of %(target)s", value=show(value), target=show(target)) if key in targets else show(value))
+                if value is None:
+                    cells[key] = "–"
+                elif key in targets:
+                    cells[key] = _("%(value)s of %(target)s", value=show(value), target=show(target))
+                else:
+                    cells[key] = show(value)
                 if value is None or not target or not weight or (key in needs_deals and len(mine) < min_deals):
                     continue
                 ratio = min((target / value if value else 1) if lower else value / target, 1)
@@ -634,7 +687,7 @@ class NativeMCP(models.AbstractModel):
         recordset = self._resolve_model(model)
         gates = self.env["mcp.enabled.model"].sudo()
         if not gates.is_method_call_enabled(model):
-            raise AccessError(_("Business methods are disabled for '%s'.") % model)
+            raise self._refusal(model, "method_calls")
         method = self._validate_native_method(model, recordset, method)
         target = (self._resolve_record_ids_or_raise(model, recordset, record_ids, self._limit_bounds()[1])
                   if record_ids else recordset)
@@ -657,6 +710,163 @@ class NativeMCP(models.AbstractModel):
             "attachment_id": attachment.id, "uri": "odoo://attachment/%s" % attachment.id,
             "name": attachment.name, "mimetype": attachment.mimetype, "file_size": attachment.file_size,
         })
+
+    @mcp_tool(
+        name="press_button",
+        title="Press Button",
+        description=(
+            "Press a button on a record's screen as the user would in Odoo, for a workflow step that no record tool "
+            "does: Create Invoice, Send PRO-FORMA Invoice, Register Payment, Mark as Lost, Validate. Give the button's "
+            "label as Odoo shows it. When it opens a form, Odoo fills it with its own values and presses that form's "
+            "main button; give wizard_values only for choices the user asked for."
+        ),
+        input_schema={"type": "object", "properties": {
+            "model": {"type": "string", "description": "Technical model of the record, for example sale.order."},
+            "record_id": {"type": "integer", "description": "The record's ID."},
+            "button": {"type": "string", "description": "The button's label, for example Create Invoice."},
+            "wizard_values": {"type": "object", "description": "Values for the form the button opens, by field name."},
+            "wizard_button": {"type": "string", "description": "Label of that form's button to press; default its main one."},
+        }, "required": ["model", "record_id", "button"], "additionalProperties": False},
+    )
+    def _press_button(self, model, record_id, button, wizard_values=None, wizard_button=None):
+        self._access(mutation=True)
+        recordset = self._resolve_model(model, "method_calls")
+        if not self.env["mcp.enabled.model"].sudo().is_method_call_enabled(model):
+            raise self._refusal(model, "method_calls")
+        record = self._resolve_record_ids_or_raise(model, recordset, [record_id], 1)
+        record.check_access("write")
+        action = self._run_button(record, self._find_button(record, button), wizard_values, wizard_button)
+        # Link to what the button opened when that is one record (the new invoice), else to the pressed record.
+        target = record
+        if (isinstance(action, dict) and action.get("res_model") in self.env
+                and isinstance(action.get("res_id"), int) and action["res_id"]):
+            target = self.env[action["res_model"]].browse(action["res_id"])
+        return _tool_result(_("Pressed %(button)s on %(record)s.") % {"button": button, "record": record.display_name},
+                            {"record": {"display_name": target.display_name},
+                             "url": "/odoo/%s/%s" % (target._name, target.id)})
+
+    def _find_button(self, record, label=None, view_id=None):
+        """The button labelled ``label`` (any case) that ``record``'s form shows for it now, or without a label the
+        form's main button. Odoo has already left out the buttons of groups the user is not in."""
+        arch = etree.fromstring(record.get_view(view_id, "form")["arch"].encode())
+        buttons = [node for node in arch.iter("button") if node.get("type") in {"object", "action"}
+                   and not any(parent.tag == "field" for parent in node.iterancestors()) and visible_for(node, record)]
+        found = ([node for node in buttons if button_label(node).casefold() == label.strip().casefold()] if label else
+                 [node for node in buttons if {"btn-primary", "oe_highlight"} & set((node.get("class") or "").split())]
+                 or buttons)
+        if not found:
+            raise UserError(_("%(record)s has no '%(button)s' button it can use now. Its buttons now: %(buttons)s.") % {
+                "record": record.display_name or record._description, "button": label or _("main"),
+                "buttons": ", ".join(dict.fromkeys(filter(None, map(button_label, buttons)))) or _("none")})
+        return found[0]
+
+    def _run_button(self, record, node, wizard_values=None, wizard_button=None, preview=False):
+        """Press ``node`` on ``record`` as Odoo's web client does and return Odoo's resulting action. When it opens a
+        form (a wizard), that form gets Odoo's defaults and ``wizard_values``, then its ``wizard_button`` (or main
+        button) is pressed. With ``preview``, describe what pressing does instead, running no business method."""
+        context = {"active_id": record.id, "active_ids": record.ids, "active_model": record._name}
+        if node.get("context"):
+            context.update(eval_view_expression(node.get("context"), record, context))
+        description = {"button": button_label(node), "warning": node.get("confirm") or "", "form": "", "values": []}
+        if node.get("type") == "action":
+            action = self.env["ir.actions.actions"].browse(int(node.get("name")))
+            action = self.env[action.type].browse(action.id).read()[0]
+        elif preview:
+            return description
+        else:
+            get_public_method(record, node.get("name"))  # Odoo's own rule for buttons: public methods only
+            action = getattr(record.with_context(**context), node.get("name"))()
+        if not (isinstance(action, dict) and action.get("target") == "new" and action.get("res_model") in self.env
+                and self.env[action["res_model"]]._transient):
+            return description if preview else action
+        form_context = action.get("context") or {}
+        if isinstance(form_context, str):
+            form_context = eval_view_expression(form_context, record, context)
+        form = self.env[action["res_model"]].with_context(**{**context, **form_context})
+        values = self._wizard_values(form, wizard_values)
+        view = action.get("view_id")
+        view = view[0] if isinstance(view, (list, tuple)) else view or None
+        if preview:
+            wizard = form.new({**form.default_get(list(form._fields)), **values})
+            return dict(description, form=action.get("name") or form._description,
+                        values=self._form_values(wizard, view)
+                        + [{"label": _("Then press"), "value": button_label(self._find_button(wizard, wizard_button, view))}])
+        wizard = form.create(values)
+        wizard_node = self._find_button(wizard, wizard_button, view)
+        if wizard_node.get("type") != "object":
+            raise UserError(_("'%s' opens another screen, which the AI cannot use; finish this step in Odoo.")
+                            % button_label(wizard_node))
+        get_public_method(wizard, wizard_node.get("name"))
+        wizard_context = eval_view_expression(wizard_node.get("context"), wizard) if wizard_node.get("context") else {}
+        result = getattr(wizard.with_context(**wizard_context), wizard_node.get("name"))()
+        if isinstance(result, dict) and result.get("target") == "new":
+            raise UserError(_("Odoo opened another form after '%s'; finish this step in Odoo.") % button_label(wizard_node))
+        return result
+
+    def _check_given(self, arguments, conversation):
+        """A new record's name and required text come from the conversation, never from the AI alone: Odoo asks for
+        a value nobody wrote (a placeholder such as "New Contact") instead of creating it, whatever the model.
+        Words naming the kind of record ("a new contact") are not values; a direct answer to the question always is."""
+        model = self.env[arguments["model"]]
+        definitions = model.fields_get(attributes=["string", "type", "required"])
+        names = [name for name, field in definitions.items()
+                 if field["type"] in {"char", "text"} and (field["required"] or name == model._rec_name)]
+        kind = _vocabulary_pattern([word for word in re.split(r"\W+", model._description) if word])
+        # What was written, and the Odoo results the user shared with the AI (values may come from those).
+        text = " ".join([entry["content"] for entry in conversation._provider_history()] + [
+            json.dumps(result, ensure_ascii=False) for result in
+            self.env["odoo.ai.assistant.tool.request"].sudo().search(
+                [("conversation_id", "=", conversation.id), ("state", "=", "shared")]).mapped("result")])
+
+        def squash(value):
+            return re.sub(r"\W+", "", value).casefold()
+
+        written, answer = squash(kind.sub(" ", text) if kind else text), squash(conversation._latest_question())
+        missing = {definitions[name]["string"] for values in [arguments.get("values"), *(arguments.get("records") or [])]
+                   if isinstance(values, dict) for name in names if isinstance(values.get(name), str)
+                   and squash(values[name]) not in written and squash(values[name]) != answer}
+        if missing:
+            raise DirectReply(_("What %(fields)s should the new %(model)s have?") % {
+                "fields": ", ".join(sorted(missing)), "model": model._description})
+
+    def _wizard_values(self, form, values):
+        """``values`` for the form a button opens, checked against its fields: never a credential or a value Odoo
+        calculates; a selection may be given by its label."""
+        definitions = form.fields_get(attributes=["string", "type", "selection", "readonly", "related", "depends"])
+        checked = {}
+        for name, value in (values or {}).items():
+            field = definitions.get(name)
+            if not field or CREDENTIAL_FIELD.search(name):
+                raise ValidationError(_("The form %(form)s has no field '%(name)s'. Fields it can take: %(fields)s.") % {
+                    "form": form._description, "name": name, "fields": ", ".join(sorted(
+                        "%s (%s)" % (key, item["string"]) for key, item in definitions.items()
+                        if not item.get("readonly") and not CREDENTIAL_FIELD.search(key))[:MAX_FIELD_SUGGESTIONS])})
+            _check_settable(name, field)
+            checked[name] = (_option_key(field, value) or value) if field["type"] == "selection" and isinstance(
+                value, str) else value
+        return checked
+
+    def _form_values(self, record, view_id=None):
+        """Label and value of the fields ``record``'s form shows, without long texts, files or credentials, for the
+        confirmation card."""
+        arch = etree.fromstring(record.get_view(view_id, "form")["arch"].encode())
+        rows = {}
+        for node in arch.iter("field"):
+            name = node.get("name")
+            field = record._fields.get(name)
+            if (name in rows or not field or field.type in {"html", "binary", "one2many"} or CREDENTIAL_FIELD.search(name)
+                    or any(parent.tag == "field" for parent in node.iterancestors()) or not visible_for(node, record)):
+                continue
+            value = record[name]
+            if field.relational:
+                value = ", ".join(value.mapped("display_name"))
+            elif field.type == "selection":
+                value = dict(field._description_selection(self.env)).get(value, value)
+            elif field.type == "boolean":
+                value = value and _("Yes")
+            if value not in (False, None, ""):
+                rows[name] = {"label": node.get("string") or field.string, "value": str(value)}
+        return list(rows.values())
 
     def _catalogue(self):
         executor = self._native()
@@ -693,7 +903,8 @@ class NativeMCP(models.AbstractModel):
             # Sharing, confirmation, argument format, record names and upload references are explained once
             # in the system instructions, which are always sent with these tools.
             "description": entry["description"]
-            + (" It describes the signed-in user, companies and timezone, not the app or screen the user has open."
+            + (" It describes the signed-in user, companies and timezone, not the app or screen the user has open. "
+               "Its result is not shared with you; to filter by the signed-in user, use %s instead." % CURRENT_USER
                if entry["name"] == "get_current_context" else ""),
             "inputSchema": entry["schema"], "strict": False,
         } for name, entry in self._catalogue().items()]
@@ -703,7 +914,14 @@ class NativeMCP(models.AbstractModel):
         # Model and field names only (no records): always available when Odoo data access is on,
         # so the AI plans with real field names instead of guessing them.
         executor._access()
-        metadata = {"models": executor._model_entries()}
+        # One short line per model ("Contact (read, create, methods)"): the same facts as MCP's entries in a
+        # fraction of the tokens, as this list goes with every request.
+        metadata = {"models": {
+            entry["model"]: "%s (%s)" % (entry["name"], ", ".join(
+                [operation for operation, allowed in entry["operations"].items() if allowed]
+                + (["methods"] if entry["allow_method_calls"] else [])))
+            for entry in executor._model_entries()
+        }}
         if request and request.tool == "mcp_get_fields":
             model = (request.arguments or {}).get("model")
             recordset = executor._check_op(model, "read")
@@ -741,32 +959,33 @@ class NativeMCP(models.AbstractModel):
             self._native(confirmed=True)._access(mutation=True)
         dependencies = []
 
-        def option_key(field, text):
-            """Selection key for ``text``: the key itself, or the one option whose label matches (any case)."""
-            text = text.strip().strip(",.;:").strip()
-            options = field.get("selection") or []
-            if text in [key for key, _label in options]:
-                return text
-            keys = [key for key, label in options if str(label).strip().casefold() == text.casefold()]
-            return keys[0] if len(keys) == 1 else None
-
-        def record_id(relation, named):
-            """ID of the one accessible ``relation`` record named ``named``, recorded as a plan dependency."""
-            matches = executor._check_op(relation, "read").name_search(named.strip(), operator="=ilike", limit=2)
-            if len(matches) != 1:
-                raise UserError((_("More than one %(model)s is named '%(name)s', so no action was prepared. "
-                                   "Choose one by its ID.") if matches else
-                                 _("No %(model)s named '%(name)s' was found, so no action was prepared.")) % {
-                                     "name": named, "model": executor.env[relation]._description})
-            record = executor.env[relation].browse(matches[0][0])
-            dependencies.append({"model": relation, "id": record.id, "name": record.display_name,
+        def depend(model, record):
+            """Record ``record`` as a plan dependency, so confirming fails if it changes meanwhile."""
+            dependencies.append({"model": model, "id": record.id, "name": record.display_name,
                                  "version": self._record_fingerprint(record)})
             return record.id
+
+        def record_id(relation, named):
+            """ID of the one accessible ``relation`` record named ``named``, recorded as a plan dependency.
+            Users are never read by the AI, yet a record may name one (a salesperson, an assignee): the exact name
+            is matched under the user's own access, outside MCP Server's model list, and nothing else is read."""
+            source = (executor.env[relation] if relation == self.env.user._name
+                      else executor._check_op(relation, "read"))
+            matches = source.name_search(named.strip(), operator="=ilike", limit=2)
+            if len(matches) != 1:
+                raise UserError((_("More than one %(model)s is named '%(name)s', so no action was prepared. "
+                                   "Describe it more precisely, with another of its fields, so that only one "
+                                   "matches.") if matches else
+                                 _("No %(model)s named '%(name)s' was found, so no action was prepared.")) % {
+                                     "name": named, "model": executor.env[relation]._description})
+            return depend(relation, executor.env[relation].browse(matches[0][0]))
 
         def resolve(value, field=None, depth=0):
             if depth > MAX_PLAN_DEPTH:
                 raise ValidationError(_("The action plan is nested too deeply."))
             value = _decoded_marker(value)
+            if value == CURRENT_USER:
+                return self.env.uid
             if isinstance(value, dict) and "$odoo_ref" in value:
                 if not entry["mutation"] or entry["custom_id"] or set(value) != {"$odoo_ref"}:
                     raise ValidationError(_("Local record references are only supported in built-in action plans."))
@@ -806,12 +1025,12 @@ class NativeMCP(models.AbstractModel):
                             raise AccessError(_("Credential fields cannot be used in local lookups."))
                 records = recordset.search(executor._coerce_domain(reference["domain"]), limit=2)
                 if len(records) != 1:
-                    raise UserError(_("The local lookup for '%s' must match exactly one accessible record. "
-                                      "No action was prepared. Use a more specific name or identifier.") % model)
+                    raise UserError(_("%(count)s %(model)s records match this description, so no action was "
+                                      "prepared. Describe it so that exactly one matches.") % {
+                                          "count": _("Several") if records else _("No"),
+                                          "model": recordset._description})
                 records.check_access("read")
-                dependencies.append({"model": model, "id": records.id, "name": records.display_name,
-                                     "version": self._record_fingerprint(records)})
-                return records.id
+                return depend(model, records)
             # A linked record given by name, as plain text or {"$odoo_selection": name}.
             named = value if isinstance(value, str) else (
                 value["$odoo_selection"] if isinstance(value, dict) and set(value) == {"$odoo_selection"} else None)
@@ -824,7 +1043,7 @@ class NativeMCP(models.AbstractModel):
                         or not isinstance(value["$odoo_selection"], str)):
                     raise ValidationError(_("Selection labels can only be used for a selection field "
                                             "in an action's values."))
-                key = option_key(field, value["$odoo_selection"])
+                key = _option_key(field, value["$odoo_selection"])
                 if key is None:
                     raise ValidationError(_("The selection label must match exactly one available option."))
                 return key
@@ -836,10 +1055,12 @@ class NativeMCP(models.AbstractModel):
 
         model = plan.get("model")
         definitions = {}
+        # What checked_value needs of a field; "depends" marks a value Odoo calculates.
+        attributes = ["string", "type", "relation", "selection", "related", "readonly", "depends"]
         if isinstance(model, str) and entry["mutation"] and not entry["custom_id"]:
-            definitions = executor._resolve_model(model).fields_get(
-                attributes=["type", "relation", "selection", "related", "readonly"],
-            )
+            # A refusal names the permission this action needs (a business method when it has no operation tag).
+            definitions = executor._resolve_model(model, entry["operation"] or "method_calls").fields_get(
+                attributes=attributes)
         # Plans from the AI provider never see record values or IDs (results stay local), so a raw
         # numeric record ID is a guess unless approved results were shared with the provider.
         guarded = entry["mutation"] and bool(self.env.context.get("odoo_ai_provider_plan")) and not (
@@ -858,10 +1079,7 @@ class NativeMCP(models.AbstractModel):
             field = (definitions if known is None else known).get(key)
             if not field:
                 return value
-            if guarded and field.get("related") and field.get("readonly"):
-                source = field["related"].split(".")[0] if isinstance(field["related"], str) else field["related"][0]
-                raise ValidationError(_("'%(field)s' is derived from '%(source)s' and cannot be set directly. "
-                                        "Set '%(source)s' instead.") % {"field": key, "source": source})
+            _check_settable(key, field)
             if field["type"] == "many2one" and field.get("relation") == "ir.model" and isinstance(value, str):
                 if value not in self.env or is_restricted_model(self.env, value):
                     raise ValidationError(_("'%s' is not an available business model.") % value)
@@ -892,17 +1110,45 @@ class NativeMCP(models.AbstractModel):
                                                     "examples": ", ".join(sorted(comodel.fields_get(
                                                         attributes=["required"]))[:MAX_LINE_FIELD_EXAMPLES])})
                     value = [[0, 0, item] for item in value]
-                # New lines get the record's own checks: option labels, linked records and tags by name.
-                line_fields = comodel.fields_get(attributes=["type", "relation", "selection", "related", "readonly"])
-                return [[0, 0, {name: resolve(checked_value(name, line_value, line_fields), line_fields.get(name))
-                                for name, line_value in command[2].items()}]
-                        if isinstance(command, list) and len(command) == 3 and command[0] == 0
-                        and isinstance(command[2], dict) else command for command in value]
+                # Only new lines, and for tags links to existing records: the AI may not edit, remove or move other
+                # records through a field. Each record touched gets the checks of a direct action on its model.
+                line_fields = comodel.fields_get(attributes=attributes)
+                commands = []
+                for command in value:
+                    if isinstance(command, list) and len(command) == 3 and command[0] == 0 and isinstance(command[2], dict):
+                        if any(CREDENTIAL_FIELD.search(name) for name in command[2]):
+                            raise AccessError(_("Credential fields cannot be changed by AI tools."))
+                        self._native(confirmed=True)._check_op(comodel._name, "create")
+                        # New lines get the record's own checks: option labels, linked records and tags by name.
+                        commands.append([0, 0, {name: resolve(checked_value(name, line_value, line_fields),
+                                                              line_fields.get(name))
+                                                for name, line_value in command[2].items()}])
+                    elif field["type"] == "many2many" and (not isinstance(command, list) or (
+                            len(command) == 2 and command[0] == 4)):
+                        # A link is [4, record] or the record alone (a name or a local reference).
+                        target = _decoded_marker(command[1] if isinstance(command, list) else command)
+                        reject_guessed_id(key, target)
+                        if type(target) is int:
+                            record = executor._check_op(comodel._name, "read").browse(target).exists()
+                            if not record:
+                                raise UserError(_("No %s with that ID was found, so no action was prepared.")
+                                                % comodel._description)
+                            record.check_access("read")
+                            commands.append([4, depend(comodel._name, record)])
+                        elif isinstance(target, str) or (
+                                isinstance(target, dict) and {"$odoo_ref", "$odoo_selection"} & set(target)):
+                            commands.append([4, resolve(target, {"type": "many2one", "relation": comodel._name})])
+                        else:
+                            raise ValidationError(_("Link '%s' records by their exact name.") % key)
+                    else:
+                        raise ValidationError(_("'%s' can only get new lines or links to existing records by name; "
+                                                "the AI cannot edit, remove or replace linked records.") % key)
+                return commands
             if field["type"] == "selection" and isinstance(value, str):
                 keys = [option[0] for option in field.get("selection") or []]
                 if keys and value not in keys:
                     # An option given by its label ("High") means its key ("2").
-                    option = option_key(field, value)
+                    option = _option_key(field, value)
                     if option is None:
                         raise ValidationError(_("'%(value)s' is not a valid option for '%(field)s'. "
                                                 "Valid options: %(options)s.") % {
@@ -991,9 +1237,10 @@ class NativeMCP(models.AbstractModel):
         operation = meta["operation"]
         if entry["name"] == "upload_attachment":
             operation = "write"
+        if entry["name"] in {"call_model_method", "press_button"} and not self.env[
+                "mcp.enabled.model"].sudo().is_method_call_enabled(model):
+            raise self._refusal(model, "method_calls")
         if entry["name"] == "call_model_method":
-            if not self.env["mcp.enabled.model"].sudo().is_method_call_enabled(model):
-                raise AccessError(_("Business method calls are disabled for this model."))
             method = executor._validate_native_method(model, recordset, arguments["method"])
             operation = utils.map_method_to_operation(method)
             recordset.check_access(operation or "write")
@@ -1010,8 +1257,13 @@ class NativeMCP(models.AbstractModel):
         for access in {operation or ("write" if entry["mutation"] else "read"), "read"}:
             records.check_access(access)
         summary_fields = ["display_name"] + (["write_date"] if "write_date" in recordset._fields else [])
-        return {"records": _json_safe(records.read(summary_fields)),
-                "version": self._record_fingerprint(records)}
+        snapshot = {"records": _json_safe(records.read(summary_fields)), "version": self._record_fingerprint(records)}
+        if entry["name"] == "press_button":
+            # What pressing does, for the card; it is checked again when the user confirms.
+            snapshot["press"] = executor._run_button(records, executor._find_button(records, arguments["button"]),
+                                                     arguments.get("wizard_values"), arguments.get("wizard_button"),
+                                                     preview=True)
+        return snapshot
 
     def _execute_native(self, tool, arguments, confirmed=False, upload_data=None):
         event = self.env["odoo.ai.assistant.tool.event"]._begin(tool)
@@ -1182,6 +1434,10 @@ class NativeToolRequest(models.Model):
         plan = arguments
         arguments, dependencies = bridge._resolve_plan(tool, plan)
         entry = bridge._entry(tool, arguments)
+        context = conversation.env.context
+        if (entry["operation"] == "create" and not entry["custom_id"] and context.get("odoo_ai_provider_plan")
+                and not context.get("odoo_ai_sample_data")):
+            bridge._check_given(arguments, conversation)
         snapshot = bridge._snapshot(entry, arguments)
         upload = self.env["odoo.ai.assistant.upload"]
         if entry["name"] == "upload_attachment":
@@ -1199,7 +1455,7 @@ class NativeToolRequest(models.Model):
             "resolution_snapshot": dependencies,
             "tool_label": entry["name"].replace("_", " "),
             "snapshot": snapshot, "mutation": entry["mutation"], "operation": entry["operation"], "upload_id": upload.id,
-            "provider": config.provider, "provider_model": config.model_id.identifier,
+            "provider": config.provider, "provider_model": conversation._model(config).identifier,
             "expires_at": fields.Datetime.now() + TOOL_REQUEST_LIFETIME,
         })
         if not entry["mutation"]:
@@ -1260,7 +1516,8 @@ class NativeToolRequest(models.Model):
         bridge = self._validate_current(conversation, check_snapshot=not self.mutation)
         config = conversation._check_enabled()
         if (not config.local_tools or not config.business_data_sharing
-                or self.provider != config.provider or self.provider_model != config.model_id.identifier):
+                or self.provider != config.provider
+                or self.provider_model != conversation._model(config).identifier):
             raise AccessError(_("Business-data sharing is disabled or the provider changed. Ask again."))
         if not self.mutation:
             fresh = bridge._execute_native(self.tool, self.arguments or {})
@@ -1444,6 +1701,14 @@ class NativeToolRequest(models.Model):
                 subject = _("Review the proposed values")
             else:
                 subject = model_label or self.tool_label or self.tool
+            press = (self.snapshot or {}).get("press")
+            if press:
+                headline = _("Press '%(button)s'", button=press["button"])
+                if press["warning"]:
+                    change_groups.append({"title": _("Odoo asks"), "items": [{"label": _("Warning"),
+                                                                              "value": press["warning"]}]})
+                change_groups.append({"title": press["form"] or _("Next step"), "items": press["values"] or [
+                    {"label": _("If Odoo opens a form"), "value": _("it is completed with Odoo's own values")}]})
             summary = {"headline": headline, "subject": subject, "targets": target_names,
                        "groups": change_groups}
             details = json.dumps({"arguments": self.arguments or {}, "targets": self.snapshot or {},
@@ -1511,7 +1776,7 @@ class NativeToolRequest(models.Model):
             "sharing_allowed": bool(config.business_data_sharing and config.enabled and config.local_tools
                                     and self.state == "done"
                                     and config.provider == self.provider
-                                    and config.model_id.identifier == self.provider_model
+                                    and self.conversation_id._model(config).identifier == self.provider_model
                                     and fields.Datetime.now() <= self.expires_at),
             "expires_at": fields.Datetime.to_string(self.expires_at),
         }

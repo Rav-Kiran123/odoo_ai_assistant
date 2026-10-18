@@ -38,9 +38,13 @@ COMPACT_TOOL_COUNT = 8
 # Characters of the latest message shown under a conversation in the chat list.
 CONVERSATION_PREVIEW_CHARS = 160
 
+# Written by the AI wherever the signed-in user's ID goes ("my deals"); Odoo puts in the ID, which the AI never sees.
+CURRENT_USER = "$current_user"
+
 # Request-check labels for a data change, and the MCP Server operation tag of the tools that perform it.
-# ACTION (a workflow, several kinds of change, or unclear) is offered every data-changing tool.
-CHANGE_OPERATIONS = {"CREATE": "create", "UPDATE": "write", "DELETE": "unlink", "ACTION": None}
+# ACTION (a workflow, several kinds of change, or unclear) is offered every data-changing tool. GENERATE is a CREATE
+# whose values the user asked the AI to make up: only then may a new record's name be one the user never wrote.
+CHANGE_OPERATIONS = {"CREATE": "create", "GENERATE": "create", "UPDATE": "write", "DELETE": "unlink", "ACTION": None}
 
 # Tool calls in one provider answer, and follow-up rounds after schema discovery.
 MAX_TOOL_CALLS = 5
@@ -84,6 +88,9 @@ DEFAULT_MAX_OUTPUT_TOKENS = 2048
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_NATIVE_RATE_LIMIT = 60
 PROVIDER_CONNECT_TIMEOUT = 10
+# Seconds an AI call leaves free before Odoo's own limit for a browser request (limit_time_real), to save the
+# answer or show the error: past that limit Odoo restarts the whole server.
+ODOO_TIME_MARGIN = 10
 # Allowed (minimum, maximum) values for the AI Settings above and the native tool rate limit.
 MAX_OUTPUT_TOKENS_RANGE = (256, 65536)
 REQUEST_TIMEOUT_RANGE = (10, 600)

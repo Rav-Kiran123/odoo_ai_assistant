@@ -54,8 +54,12 @@
                 <img t-foreach="payload.images" t-as="image" t-key="image_index"
                     class="img-fluid mb-2" alt="Locally retrieved attachment"
                     t-att-src="'data:' + image.mimeType + ';base64,' + image.data"/>
-                <a t-foreach="payload.links" t-as="link" t-key="link_index"
-                    class="d-block mb-2" t-att-href="link.url" target="_blank" rel="noopener noreferrer" t-esc="link.label"/>
+                <div t-if="payload.links.length" class="mb-2">
+                    <span t-if="linksChangedRecords" class="me-1">Please click here to view your changes:</span>
+                    <a t-foreach="payload.links" t-as="link" t-key="link_index"
+                        t-att-class="{'d-block': payload.links.length > 1 or !linksChangedRecords}" t-att-href="link.url"
+                        target="_blank" rel="noopener noreferrer" t-esc="link.label"/>
+                </div>
                 <p class="small text-muted my-2" role="status" t-esc="planState"/>
                 <div t-if="payload.state === 'pending'" class="d-flex gap-2 flex-wrap">
                     <button type="button" class="btn btn-sm btn-primary" t-att-disabled="props.busy"

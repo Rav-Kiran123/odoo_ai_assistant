@@ -1,3 +1,7 @@
+import logging
+
+import requests
+
 from odoo import Command, api, fields, models, _
 from odoo.exceptions import AccessError, ValidationError
 
@@ -6,6 +10,8 @@ from .limits import (
     REQUEST_TIMEOUT_RANGE,
 )
 from .providers import PROVIDERS, ProviderClient
+
+_logger = logging.getLogger(__name__)
 
 
 class AIProviderModel(models.Model):
@@ -19,6 +25,12 @@ class AIProviderModel(models.Model):
     active = fields.Boolean(default=True)
     # Set from the provider's token prices on refresh; empty when the provider does not publish them.
     pricing = fields.Selection([("free", "Free"), ("commercial", "Commercial")], readonly=True)
+    # USD per million tokens, set on refresh from the provider's catalogue (OpenRouter) or OpenRouter's public
+    # price list for a direct provider's model; they estimate each request's cost on the Usage dashboard.
+    price_input = fields.Float(string="Input price (USD per 1M tokens)", digits=(16, 4))
+    price_output = fields.Float(string="Output price (USD per 1M tokens)", digits=(16, 4))
+    price_cache_read = fields.Float(string="Cached input price (USD per 1M tokens)", digits=(16, 4))
+    price_cache_write = fields.Float(string="Cache write price (USD per 1M tokens)", digits=(16, 4))
     _unique_model = models.Constraint("UNIQUE(provider, identifier)", "Model already exists.")
 
     @api.model
@@ -29,14 +41,44 @@ class AIProviderModel(models.Model):
         entries = ProviderClient(provider, key, observer=observer, timeout=timeout).models()
         if not entries:
             raise ValidationError(_("No usable models were returned by this provider."))
+        public = {}
+        if not any(prices for _identifier, _name, prices in entries):
+            # Direct providers list no prices: estimate from OpenRouter's public list; costs stay unknown without it.
+            try:
+                public = ProviderClient.public_prices(provider, [identifier for identifier, *_rest in entries], timeout)
+            except (requests.RequestException, ValueError):
+                _logger.info("AI model prices for %s could not be read from OpenRouter's public list.", provider)
         existing = self.with_context(active_test=False).search([("provider", "=", provider)])
         by_id = {record.identifier: record for record in existing}
         existing.write({"active": False})
-        for identifier, name, pricing in entries:
+        for identifier, name, prices in entries:
+            values = {"name": name, "active": True}
+            if prices := prices or public.get(identifier):
+                charged = prices["price_input"] or prices["price_output"]
+                values.update(prices, pricing="commercial" if charged else "free")
             if identifier in by_id:
-                by_id[identifier].write({"name": name, "pricing": pricing, "active": True})
+                by_id[identifier].write(values)
             else:
-                self.create({"provider": provider, "identifier": identifier, "name": name, "pricing": pricing})
+                self.create({"provider": provider, "identifier": identifier, **values})
+        # Requests recorded before these prices were known get their estimated cost now.
+        models = {record.identifier: record for record in self.with_context(active_test=False).search(
+            [("provider", "=", provider)])}
+        for usage in self.env["odoo.ai.assistant.usage"].sudo().search(
+                [("provider", "=", provider), ("tokens_known", "=", True), ("cost_source", "=", False)]):
+            model = models.get(usage.model_name)
+            if model and (cost := model._cost(usage)) is not None:
+                usage.write({"cost": cost, "cost_source": "estimate"})
+
+    def _cost(self, tokens):
+        """Estimated USD cost of a request's token counts (a dict or a usage record) at this model's prices;
+        None without prices."""
+        self.ensure_one()
+        if not (self.price_input or self.price_output):
+            return None
+        fresh = tokens["input_tokens"] - tokens["cached_tokens"]
+        return (fresh * self.price_input + tokens["output_tokens"] * self.price_output
+                + tokens["cached_tokens"] * (self.price_cache_read or self.price_input)
+                + tokens["cache_write_tokens"] * (self.price_cache_write or self.price_input)) / 1_000_000
 
 
 class AIConfig(models.Model):
@@ -44,7 +86,7 @@ class AIConfig(models.Model):
     _description = "AI App Configuration"
 
     name = fields.Char(default="AI Settings", required=True)
-    enabled = fields.Boolean(string="Enable AI Assistant")
+    enabled = fields.Boolean(string="Enable AI Agent")
     provider = fields.Selection(PROVIDERS, default="openai", required=True)
     api_key = fields.Char(string="API Key", copy=False)
     model_id = fields.Many2one("odoo.ai.assistant.provider.model", string="AI Model")
@@ -76,10 +118,11 @@ class AIConfig(models.Model):
                 raise ValidationError(_("Choose a provider timeout between %(low)s and %(high)s seconds.",
                                         low=low, high=high))
 
-    def _client(self, purpose):
-        """Provider client for the configured model, recording usage for `purpose`."""
+    def _client(self, purpose, model=None):
+        """Provider client recording usage for `purpose` under `model` (a conversation's), else the configured one."""
         self.ensure_one()
-        observer = self.env["odoo.ai.assistant.usage"]._observer(self.provider, self.model_id.identifier, purpose)
+        observer = self.env["odoo.ai.assistant.usage"]._observer(
+            self.provider, (model or self.model_id).identifier, purpose)
         return ProviderClient(
             self.provider, self.api_key, observer=observer,
             max_output_tokens=self.max_output_tokens, timeout=self.request_timeout,
@@ -113,13 +156,14 @@ _SETTINGS_FIELDS = (
 
 
 def _plain(value):
+    """A field value as settings store it: a record becomes its ID, anything else is kept as is."""
     return value.id if isinstance(value, models.BaseModel) else value
 
 
 class ResConfigSettings(models.TransientModel):
     _inherit = "res.config.settings"
 
-    ai_assistant_enabled = fields.Boolean(string="Enable AI Assistant")
+    ai_assistant_enabled = fields.Boolean(string="Enable AI Agent")
     ai_assistant_provider = fields.Selection(PROVIDERS, string="AI provider")
     ai_assistant_api_key = fields.Char(string="API Key")
     ai_assistant_key_provider = fields.Char()
@@ -184,7 +228,7 @@ class ResUsers(models.Model):
     # Access is the AI Assistant group (No / Yes) on the user's Access Rights tab;
     # this flag mirrors the group for code and tests.
     ai_assistant_enabled = fields.Boolean(
-        string="AI Assistant access", compute="_compute_ai_access", inverse="_inverse_ai_access",
+        string="AI Agent access", compute="_compute_ai_access", inverse="_inverse_ai_access",
     )
 
     @api.depends("all_group_ids")

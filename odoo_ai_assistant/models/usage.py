@@ -36,6 +36,11 @@ class AIUsage(models.Model):
     cache_write_tokens = fields.Integer(readonly=True)
     total_tokens = fields.Integer(readonly=True)
     tokens_known = fields.Boolean(readonly=True)
+    # USD, as providers bill: the provider's own figure when it reports one (OpenRouter), else the tokens at the
+    # model's prices; empty when neither is known.
+    cost = fields.Float(string="Cost (USD)", digits=(16, 6), readonly=True)
+    cost_source = fields.Selection([("provider", "Reported by provider"), ("estimate", "Estimated from prices")],
+                                   readonly=True)
     duration_ms = fields.Integer(readonly=True)
     http_status = fields.Integer(readonly=True)
     note = fields.Char(readonly=True)
@@ -56,45 +61,57 @@ class AIUsage(models.Model):
                 ("create_date", ">=", self._local_midnight(start - timedelta(days=days))),
                 ("create_date", "<", self._local_midnight(start)),
             ]
-        measures = ["api_calls:sum", "total_tokens:sum", "input_tokens:sum", "output_tokens:sum", "cached_tokens:sum"]
+        amounts = ["api_calls:sum", "total_tokens:sum", "cost:sum"]
+        answered = [("purpose", "=", "reply"), ("status", "=", "received")]
 
         def totals(where):
-            calls, tokens, incoming, outgoing, cached = self._read_group(where, [], measures)[0]
+            calls, tokens, cost, incoming, outgoing, cached = self._read_group(
+                where, [], amounts + ["input_tokens:sum", "output_tokens:sum", "cached_tokens:sum"])[0]
             failed = self.search_count(where + [("status", "=", "failed")])
             users = len(self._read_group(where + [("user_id", "!=", False)], ["user_id"], ["__count"]))
             return {
-                "calls": calls or 0, "tokens": tokens or 0, "input_tokens": incoming or 0,
+                "calls": calls or 0, "tokens": tokens or 0, "cost": cost or 0, "input_tokens": incoming or 0,
                 "output_tokens": outgoing or 0, "cached_tokens": cached or 0,
-                "failed_calls": failed, "active_users": users,
+                "failed_calls": failed, "active_users": users, "answers": self.search_count(where + answered),
+                # Calls whose tokens are known but whose model has no price: the cost total leaves them out.
+                "unpriced_calls": self.search_count(where + [("tokens_known", "=", True), ("cost_source", "=", False)]),
             }
 
-        def breakdown(groupby, label):
-            rows = [{"label": label(key), "calls": calls or 0, "tokens": tokens or 0}
-                    for key, calls, tokens in self._read_group(domain, [groupby], measures[:2])]
-            return sorted(rows, key=lambda row: (row["tokens"], row["calls"]), reverse=True)
+        def breakdown(groupby, label, extra=lambda key: {}):
+            answers = dict(self._read_group(domain + answered, [groupby], ["__count"]))
+            failed = dict(self._read_group(domain + [("status", "=", "failed")], [groupby], ["__count"]))
+            rows = [{"label": label(key), "calls": calls or 0, "tokens": tokens or 0, "cost": cost or 0,
+                     "answers": answers.get(key, 0), "failed": failed.get(key, 0), **extra(key)}
+                    for key, calls, tokens, cost in self._read_group(domain, [groupby], amounts)]
+            return sorted(rows, key=lambda row: (row["cost"], row["tokens"], row["calls"]), reverse=True)
 
         purposes = dict(self._fields["purpose"]._description_selection(self.env))
         providers = dict(self._fields["provider"]._description_selection(self.env))
         daily = {}
-        for day, calls, tokens in self._read_group(domain, ["create_date:day"], measures[:2]):
+        for day, calls, tokens, cost in self._read_group(domain, ["create_date:day"], amounts):
             day = day.date() if hasattr(day, "date") else day
-            daily[day] = {"calls": calls or 0, "tokens": tokens or 0}
+            daily[day] = {"calls": calls or 0, "tokens": tokens or 0, "cost": cost or 0}
         if daily or start:
             first = start or min(daily)
             span = (today - first).days + 1
             series = [{"date": fields.Date.to_string(first + timedelta(days=offset)),
-                       **daily.get(first + timedelta(days=offset), {"calls": 0, "tokens": 0})}
+                       **daily.get(first + timedelta(days=offset), {"calls": 0, "tokens": 0, "cost": 0})}
                       for offset in range(max(span, 0))]
         else:
             series = []
+        usd = self.env.ref("base.USD")
         return {
             "period": period,
+            # Providers bill in US dollars; the dashboard shows costs with Odoo's own USD symbol and position.
+            "currency": {"symbol": usd.symbol, "position": usd.position},
             "totals": totals(domain),
             "previous": totals(previous_domain) if previous_domain is not None else None,
             "daily": series,
             "by_model": breakdown("model_name", lambda key: key or _("Unknown model")),
             "by_provider": breakdown("provider", lambda key: providers.get(key, _("Unknown provider"))),
-            "by_user": breakdown("user_id", lambda key: key.display_name if key else _("Deleted user")),
+            # Odoo's system user (OdooBot) runs technical calls, not a person's: counted, never ranked.
+            "by_user": breakdown("user_id", lambda key: key.display_name if key else _("Deleted user"),
+                                 lambda key: {"person": bool(key) and not key._is_superuser()}),
             "by_purpose": breakdown("purpose", lambda key: purposes.get(key, _("Other"))),
         }
 
@@ -136,6 +153,13 @@ class AIUsage(models.Model):
                 "note": data.get("note", ""),
             }
             counts = data.get("tokens")
+            if data.get("cost") is not None:
+                values.update(cost=data["cost"], cost_source="provider")
+            elif counts is not None:
+                model = self.env["odoo.ai.assistant.provider.model"].sudo().with_context(active_test=False).search(
+                    [("provider", "=", provider), ("identifier", "=", model_name)], limit=1)
+                if model and (cost := model._cost(counts)) is not None:
+                    values.update(cost=cost, cost_source="estimate")
             if counts is not None:
                 values.update(counts, tokens_known=True)
             elif purpose != "catalogue" and event == "received":

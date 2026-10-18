@@ -19,7 +19,8 @@ TOOLS = [
         "name": "odoo_app_structure",
         "description": "Discover the actual apps and their accessible menus/screens in this Odoo instance. "
                        "Use for what is inside an app, what apps are installed/available, and navigation questions. "
-                       "No hardcoded app list. Supply app='' to list apps, or an app name to inspect it. "
+                       "No hardcoded app list. Supply app='' to list the installed apps, or an app name to inspect only "
+                       "that app's own menus, even when the app itself manages apps or modules. "
                        "Menu paths, record models and view types are displayed locally, not business records.",
         "inputSchema": {"type": "object", "properties": {
             "app": {"type": "string", "description": "App name; empty to list available apps"},
@@ -59,15 +60,16 @@ def chart_models(env):
                   and env[name].has_access("read"))
 
 
-def data_access_menus(env):
-    """Where an administrator chooses the data the AI may read, as the menus are currently named
-    (this app's settings, then MCP Server's model list)."""
+def data_access_menus(env, settings=True):
+    """Where an administrator chooses the data the AI may use, as the menus are currently named
+    (this app's settings unless ``settings`` is False, then MCP Server's model list)."""
     menus = env["ir.ui.menu"].sudo()
-    settings = env.ref("odoo_ai_assistant.assistant_settings_menu", raise_if_not_found=False)
+    if settings:
+        menus |= env.ref("odoo_ai_assistant.assistant_settings_menu", raise_if_not_found=False) or menus
     models_action = env.ref("mcp_server.action_mcp_enabled_models", raise_if_not_found=False)
     if models_action:
-        menus = menus.search([("action", "=", "%s,%s" % (models_action._name, models_action.id))])
-    return " or ".join((settings.sudo() | menus).mapped(lambda menu: menu.complete_name.replace("/", " > ")))
+        menus |= menus.search([("action", "=", "%s,%s" % (models_action._name, models_action.id))])
+    return " or ".join(menus.mapped(lambda menu: menu.complete_name.replace("/", " > ")))
 
 
 def requested_chart_tool(tools):
@@ -95,9 +97,9 @@ def available_tools(env):
                            "by one field and counts them, or sums or averages a numeric field, with the "
                            "user's permissions; the result stays in Odoo. Use real field names (from the "
                            "field list or mcp_get_fields); dates group by the chosen interval. "
-                           "Set model to the technical model of the records the user asked about, even when "
-                           "it is not in this list, and never substitute a different model: Odoo explains "
-                           "when it is not available. Models available for charts: " + ", ".join(models) + ".",
+                           "Set model to the technical model of the records the user asked about, and never "
+                           "substitute a different model: Odoo explains when it is not available. Charts use the "
+                           "models native_schema lists with read.",
             "inputSchema": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Technical model of the records to chart"},
                 "group_by": {"type": "string", "description": "Field to group by"},

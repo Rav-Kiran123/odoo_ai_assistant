@@ -5,9 +5,9 @@
         <field name="inherit_id" ref="base.res_config_settings_view_form"/>
         <field name="arch" type="xml">
             <xpath expr="//form" position="inside">
-                <app string="AI Assistant" name="odoo_ai_assistant" groups="base.group_system" logo="/odoo_ai_assistant/static/description/icon.svg">
+                <app string="AI Agent" name="odoo_ai_assistant" groups="base.group_system" logo="/odoo_ai_assistant/static/description/icon.svg">
                     <block title="AI Settings / App Configuration">
-                        <setting string="Enable AI Assistant" help="Grant each user access on their Access Rights tab, in the AI section.">
+                        <setting string="Enable AI Agent" help="Grant each user access on their Access Rights tab, in the AI section.">
                             <field name="ai_assistant_enabled"/>
                             <div class="alert alert-warning mt-3 mb-0" role="alert">
                                 Messages typed in the chat are sent to your AI provider; do not type sensitive data into the chat.

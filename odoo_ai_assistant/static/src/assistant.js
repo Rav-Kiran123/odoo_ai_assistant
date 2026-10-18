@@ -168,13 +168,16 @@ registry.category("services").add("odoo_ai", {
                     return true;
                 }, { fallback: false, needsChat: true, progress: _t("Loading the record page") });
             },
-            /** Administrators: the models AI Settings offers, and switching to one of them. */
+            /** Administrators: the models of the AI Settings provider, and switching the open conversation to one. */
             modelChoices() {
                 return service.run(() => orm.call(MODEL, "model_choices", []), { fallback: null });
             },
-            setModel(modelId) {
+            async setModel(modelId) {
+                if (!state.current && !(await service.newChat())) {
+                    return;
+                }
                 return service.run(async () => {
-                    await orm.call(MODEL, "set_model", [modelId]);
+                    await orm.call(MODEL, "set_model", [[state.current.id], modelId]);
                     await service.refresh();
                 });
             },
@@ -589,9 +592,15 @@ export class AssistantPanel extends Component {
         }
     }
 
+    /** The open conversation's model; a new chat uses the AI Settings model. */
+    get currentModel() {
+        const current = this.state.conversations.find((conversation) => conversation.id === this.state.current?.id);
+        return current ? { value: current.model_id, label: current.model }
+            : { value: this.state.model_id, label: this.state.model };
+    }
+
     get modelChoices() {
-        return this.models.choices.length ? this.models.choices
-            : [{ value: this.state.model_id, label: this.state.model }];
+        return this.models.choices.length ? this.models.choices : [this.currentModel];
     }
 
     async loadModelChoices() {
@@ -599,7 +608,7 @@ export class AssistantPanel extends Component {
     }
 
     selectModel(modelId) {
-        if (modelId && modelId !== this.state.model_id) {
+        if (modelId && modelId !== this.currentModel.value) {
             return this.ai.setModel(modelId);
         }
     }

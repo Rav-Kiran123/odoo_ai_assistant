@@ -17,6 +17,8 @@
                 <field name="cached_tokens" optional="hide"/>
                 <field name="cache_write_tokens" optional="hide"/>
                 <field name="total_tokens" sum="Known tokens"/>
+                <field name="cost" sum="Known cost"/>
+                <field name="cost_source" optional="hide"/>
                 <field name="duration_ms" optional="hide"/>
                 <field name="http_status" optional="hide"/>
                 <field name="note" optional="show"/>
@@ -28,11 +30,11 @@
         <field name="model">odoo.ai.assistant.usage</field>
         <field name="arch" type="xml">
             <form create="0" edit="0" delete="0">
-                <div class="alert alert-info" role="status">Token counts come from the provider's response. Catalogue requests and failed/time-out calls may have no reported tokens. Pending entries indicate an attempt without a recorded response. No prompts, keys or record results are stored here.</div>
+                <div class="alert alert-info" role="status">Token counts come from the provider's response. Catalogue requests and failed/time-out calls may have no reported tokens. Pending entries indicate an attempt without a recorded response. Cost is the provider's own figure when it reports one (OpenRouter), otherwise the tokens at the model's prices. No prompts, keys or record results are stored here.</div>
                 <sheet>
                     <group>
                         <group><field name="create_date"/><field name="user_id"/><field name="provider"/><field name="model_name"/><field name="purpose"/><field name="status"/><field name="http_status"/><field name="duration_ms"/></group>
-                        <group><field name="tokens_known"/><field name="input_tokens"/><field name="output_tokens"/><field name="cached_tokens"/><field name="cache_write_tokens"/><field name="total_tokens"/><field name="note"/></group>
+                        <group><field name="tokens_known"/><field name="input_tokens"/><field name="output_tokens"/><field name="cached_tokens"/><field name="cache_write_tokens"/><field name="total_tokens"/><field name="cost"/><field name="cost_source"/><field name="note"/></group>
                     </group>
                 </sheet>
             </form>
@@ -47,6 +49,7 @@
                 <field name="purpose" type="col"/>
                 <field name="api_calls" type="measure"/>
                 <field name="total_tokens" type="measure"/>
+                <field name="cost" type="measure"/>
             </pivot>
         </field>
     </record>

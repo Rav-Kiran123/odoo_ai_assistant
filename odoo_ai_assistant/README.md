@@ -166,7 +166,7 @@ The module is free (LGPL-3). You pay your AI provider for what the chat uses.
 | **Your data** | Not sent → a 100-row result costs the same as a 1-row result |
 | **In money** | On a paid "mini"/"flash"-class model: a fraction of a cent to a few cents per question (check your provider's prices) |
 | **Free AI plans** | Work, but run out fast (often ~50 requests/day ≈ 15–25 questions) |
-| **Tracking** | **AI Assistant → Reporting → Usage** shows calls, tokens and users per day, model and person |
+| **Tracking** | **AI Agent → Reporting → Usage** shows cost, calls, tokens and users per day, model and person |
 
 ---
 
@@ -174,7 +174,7 @@ The module is free (LGPL-3). You pay your AI provider for what the chat uses.
 
 | | |
 |---|---|
-| **Open it** | Click the 🪄 **magic wand** in the top bar (resize, minimise or go full screen) — or open the **AI Assistant** app, or **Discuss → AI conversations** |
+| **Open it** | Click the 🪄 **magic wand** in the top bar (resize, minimise or go full screen) — or open the **AI Agent** app, or **Discuss → AI conversations** |
 | **New chat** | The **+** button. Your past chats are listed on the left, with search and an **Unread** filter |
 | **Attach a file** | **➕ → Attach Files** — PDF, Word, Excel, PowerPoint, images, text. (Scanned PDFs can't be read: they are pictures of text.) |
 | **Speak** | **➕ → Voice Message** or **Alt + V**; your browser types what you say |
@@ -207,16 +207,16 @@ module (third-party, not included) · an API key from OpenAI, Anthropic, Google 
 
 ## ⚙️ Settings explained
 
-**Settings → AI Assistant** (administrators only).
+**Settings → AI Agent** (administrators only).
 
 ### Basics
 
 | Setting | What it does | Example | Default |
 |---|---|---|---|
-| **Enable AI Assistant** | The main switch for everyone | Untick during a provider outage → the chat disappears for all | Off |
+| **Enable AI Agent** | The main switch for everyone | Untick during a provider outage → the chat disappears for all | Off |
 | **AI provider · API Key · AI Model** | Which AI answers, and on whose account. Administrators can also switch the **AI Model** from the dropdown at the top of a conversation in Discuss; it changes this same setting, for everyone | OpenAI + your key + a "mini" model | — |
 | **Refresh available models** | Reloads the provider's model list. For OpenRouter you can filter **Free / Commercial**; models that can't use Odoo's tools are hidden | A new model is released → click Refresh | — |
-| **User access** | Per person: **Settings → Users → Access Rights → AI → AI Assistant = Yes** | Sales staff Yes, warehouse No | No |
+| **User access** | Per person: **Settings → Users → Access Rights → AI → AI Agent = Yes** | Sales staff Yes, warehouse No | No |
 
 ### What the AI may do
 
@@ -248,7 +248,7 @@ module (third-party, not included) · an API key from OpenAI, Anthropic, Google 
 
 | You see | What to do |
 |---|---|
-| No 🪄 in the top bar | Tick **Enable AI Assistant**, set the user's **AI Assistant = Yes**, reload |
+| No 🪄 in the top bar | Tick **Enable AI Agent**, set the user's **AI Agent = Yes**, reload |
 | *"Select an available model in AI Settings first"* | Choose an **AI Model** and **Save** |
 | HTTP **401 / 403** | The provider rejected the API key — paste a valid one |
 | HTTP **429 … rate limit or usage quota** | The provider plan's limit is reached — wait, or use a paid plan |

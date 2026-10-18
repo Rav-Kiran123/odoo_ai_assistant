@@ -27,11 +27,12 @@ from .limits import (
     WELCOME_SUGGESTIONS, is_restricted_model,
 )
 from .navigation import (
-    accessible_apps, accessible_menu_names, app_screens, app_structure, apps_named_in, apps_using_models,
-    buttons_named_in, current_screen, screen_context, screen_details, screen_details_for_ai,
+    accessible_apps, accessible_menu_names, app_screens, app_structure, apps_named_in, apps_using_models, filters_named_in,
+    buttons_named_in, current_screen, menus_named_in, screen_context, screen_details, screen_details_for_ai,
+    unknown_model_names,
 )
 from .native_mcp import (
-    _IMAGE_TYPES, _UPLOAD_REFERENCE, MAX_UPLOAD_BYTES, NATIVE_TOOL_PREFIX,
+    _IMAGE_TYPES, _UPLOAD_REFERENCE, MAX_UPLOAD_BYTES, NATIVE_TOOL_PREFIX, PRESS_TOOL, DirectReply,
 )
 
 
@@ -51,6 +52,8 @@ class AIConversation(models.Model):
     channel_id = fields.Many2one("discuss.channel", required=True, ondelete="cascade")
     message_ids = fields.One2many("odoo.ai.assistant.message", "conversation_id")
     last_read_message_id = fields.Integer(default=0)
+    # Chosen by an administrator from the chat for this conversation only; empty uses the AI Settings model.
+    model_id = fields.Many2one("odoo.ai.assistant.provider.model", ondelete="set null")
     _unique_channel = models.Constraint("UNIQUE(channel_id)", "Channel already linked.")
 
     @api.model
@@ -61,7 +64,7 @@ class AIConversation(models.Model):
     def _check_enabled(self):
         config = self.env["odoo.ai.assistant.config"]._configuration()
         if not self._enabled_for_user(config):
-            raise AccessError(_("AI Assistant is disabled for your user. Contact your administrator."))
+            raise AccessError(_("AI Agent is disabled for your user. Contact your administrator."))
         return config
 
     def _owned(self):
@@ -109,8 +112,10 @@ class AIConversation(models.Model):
         entries = []
         for conversation in conversations:
             latest = latest_by_conversation.get(conversation.id, Message)
+            model = conversation._model(config)
             entries.append({
                 "id": conversation.id, "name": conversation.name,
+                "model_id": model.id, "model": model.name or _("Not configured"),
                 "preview": latest.content[:CONVERSATION_PREVIEW_CHARS] if latest else _("This is the start of your conversation"),
                 "date": fields.Datetime.to_string(latest.create_date or conversation.create_date),
                 "unread": unread.get(conversation.id, 0),
@@ -140,14 +145,21 @@ class AIConversation(models.Model):
     def model_choices(self):
         return [{"value": model.id, "label": model.name} for model in self._available_models()]
 
-    @api.model
     def set_model(self, model_id):
-        """Change the AI Settings model from the chat; like the Settings page, it applies to every user."""
+        """Change the AI model of this conversation only (administrators); AI Settings keeps the default model
+        of every other conversation."""
+        self._owned()
         model = (not isinstance(model_id, bool) and isinstance(model_id, int)
                  and self._available_models([("id", "=", model_id)]))
         if not model:
             raise ValidationError(_("Select an available model."))
-        self.env["odoo.ai.assistant.config"]._configuration().model_id = model
+        self.sudo().model_id = model
+
+    def _model(self, config):
+        """The model this conversation uses: the one chosen for it while it still belongs to the AI Settings provider
+        and is available (only that provider's key is stored), otherwise the AI Settings model."""
+        chosen = self.sudo().model_id  # AI models are readable by administrators only, as AI Settings is
+        return chosen if chosen.active and chosen.provider == config.provider else config.model_id
 
     @api.model
     def _suggested_apps(self, config):
@@ -211,7 +223,7 @@ class AIConversation(models.Model):
         ).mapped("content")
         if not prompts:
             return ""
-        return config._client("title").conversation_title(config.model_id.identifier, prompts)
+        return config._client("title", self._model(config)).conversation_title(self._model(config).identifier, prompts)
 
     def _apply_title(self, title):
         self.sudo().write({"name": title, "title_pending": False})
@@ -238,6 +250,10 @@ class AIConversation(models.Model):
         return self.get_messages(mark_read=False)
 
     def _store_answer(self, content, local_only=False, payload=None, execution_steps=None, provider_sensitive=False):
+        # The AI may name models from memory; say which ones this database does not have.
+        invented = [] if local_only else unknown_model_names(self.env, content)
+        if invented:
+            content += "\n\n" + _("Not found in this Odoo: %s.") % ", ".join(f"`{name}`" for name in invented)
         self.env["odoo.ai.assistant.message"].sudo().create({
             "conversation_id": self.id, "role": "assistant",
             "content": content, "local_only": local_only, "payload": payload,
@@ -352,13 +368,13 @@ class AIConversation(models.Model):
         config = self._check_enabled()
         event = self.env["odoo.ai.assistant.tool.event"]._begin(request.tool, state="shared")
         history = self._provider_history()
-        client = config._client("reply")
+        client = config._client("reply", self._model(config))
         options = {"native_tools": True, "tool_context": evidence, "tool_images": images}
         if config.screen_metadata:
             options["screen_context"] = screen_context(self.env, menus=False)
         try:
             tools = [tool for tool in available_tools(self.env) if tool["name"].startswith(NATIVE_TOOL_PREFIX)]
-            text, calls = client.reply(config.model_id.identifier, history, tools, **options)
+            text, calls = client.reply(self._model(config).identifier, history, tools, **options)
         except Exception:
             self.env["odoo.ai.assistant.tool.event"]._finish(event, "failed")
             raise
@@ -486,7 +502,7 @@ class AIConversation(models.Model):
     def _provider_text(self, message):
         """A message as the AI provider reads it: the user's text plus a reference to each attached file."""
         files = message.payload.get("files", []) if message.payload and message.payload.get("kind") == "files" else []
-        return "\n".join([message.content] * bool(message.content) + [
+        return "\n".join(([message.content] if message.content else []) + [
             _("Use staged file %(name)s, reference %(reference)s.", name=file["name"], reference=file["reference"])
             for file in files
         ])
@@ -499,7 +515,7 @@ class AIConversation(models.Model):
         if not (content or uploads) or len(content) > MAX_MESSAGE_CHARS:
             raise ValidationError(_("AI messages must contain 1 to %s characters of text.") % f"{MAX_MESSAGE_CHARS:,}")
         config = self.env["odoo.ai.assistant.config"]._configuration()
-        if not config.model_id or not config.model_id.active:
+        if not self._model(config).active:
             raise UserError(_("Select an available model in AI Settings first."))
         self.env["odoo.ai.assistant.message"].sudo().create({
             "conversation_id": self.id, "role": "user", "content": content,
@@ -509,8 +525,8 @@ class AIConversation(models.Model):
         self.sudo().write({"write_date": fields.Datetime.now()})
         if not uploads and ProviderClient.is_standalone_greeting(content):
             self._progress(_("Responding to your greeting"))
-            text, calls = config._client("reply").reply(
-                config.model_id.identifier, [{"role": "user", "content": content}], [],
+            text, calls = config._client("reply", self._model(config)).reply(
+                self._model(config).identifier, [{"role": "user", "content": content}], [],
                 system_override=GREETING_INSTRUCTIONS,
             )
             if calls or not text.strip():
@@ -522,8 +538,8 @@ class AIConversation(models.Model):
         steps = []
         progress = partial(self._add_step, steps)
         progress(_("Checking your request"))
-        intent = config._client("scope").classify_request(
-            config.model_id.identifier, history, app_names=accessible_apps(self.env),
+        intent = config._client("scope", self._model(config)).classify_request(
+            self._model(config).identifier, history, app_names=accessible_apps(self.env),
             vocabulary=accessible_menu_names(self.env), intent=config.local_tools,
             topic_known=self._mentions_staged_upload(history),
         )
@@ -531,19 +547,24 @@ class AIConversation(models.Model):
             self._store_answer(self.env._(SCOPE_REFUSAL), execution_steps=steps)
             return
         action_request, chart_request = intent in CHANGE_OPERATIONS, intent == "CHART"
+        help_request = intent == "HELP"
+        # Made-up values were asked for: new records may then carry names the user never wrote (see _prepare_request).
+        self = self.with_context(odoo_ai_sample_data=intent == "GENERATE")
         change_tools = []
         if config.local_tools:
             change_tools = self._tools_for(tools, action=True)
             tools = self._tools_for(tools, action=action_request, operation=CHANGE_OPERATIONS.get(intent))
-        progress(_("Selecting approved local tools"))
-        client = config._client("reply")
+        if help_request:
+            tools = []  # general Odoo know-how: no tools or model list, a fraction of a data request's size
+        progress(_("Answering from Odoo know-how") if help_request else _("Selecting approved local tools"))
+        client = config._client("reply", self._model(config))
         # Reads are offered no data-changing tools, so their rules are left out of the instructions.
-        context_options = dict(self._reply_context(config), change_request=action_request)
+        context_options = dict(self._reply_context(config, data=not help_request), change_request=action_request)
         selected_view = requested_chart_tool(tools) if chart_request else None
         reply_tools = [selected_view] if selected_view else tools
         try:
             text, calls = client.reply(
-                config.model_id.identifier, history, reply_tools,
+                self._model(config).identifier, history, reply_tools,
                 tool_choice=selected_view["name"] if selected_view else None, **context_options,
             )
         except ProviderError as error:
@@ -551,7 +572,7 @@ class AIConversation(models.Model):
                 raise
             # The model ignored the chart instruction; let it choose freely among all tools once.
             reply_tools = tools
-            text, calls = client.reply(config.model_id.identifier, history, tools, **context_options)
+            text, calls = client.reply(self._model(config).identifier, history, tools, **context_options)
         try:
             title = self._topic_title(config)
         except UserError:
@@ -568,43 +589,66 @@ class AIConversation(models.Model):
         if title:
             self._apply_title(title)
 
-    def _reply_context(self, config, request=None, action_schema=False):
+    def _reply_context(self, config, request=None, action_schema=False, data=True):
+        """Context for a reply; without ``data`` (a question general Odoo knowledge answers) the model list and
+        named filters are left out, as no record tool is offered."""
         context = {}
         if config.screen_metadata:
             context = screen_context(self.env, menus=False)
             screen = current_screen(self.env, self.env.context.get("odoo_ai_screen"))
             if screen:
                 context["current_screen"] = screen
+            context.update(self._menus_named())
         if config.local_tools:
             context["calendar"] = {
                 "today": fields.Date.to_string(fields.Date.context_today(self)),
                 "timezone": self.env.user.tz or "UTC",
             }
-            metadata = self.env["odoo.ai.assistant.native.mcp"]._planning_context(request, all_fields=action_schema)
-            if metadata is not None:
+            metadata = data and self.env["odoo.ai.assistant.native.mcp"]._planning_context(
+                request, all_fields=action_schema)
+            if metadata:
                 context["native_schema"] = metadata
+            named = data and filters_named_in(self.env, self._latest_question(), chart_models(self.env))
+            if named:
+                context["named_filters"] = named
             # The AI Settings' own labels, so the AI knows these are settings an administrator changes, not records.
             context["ai_settings"] = [field["string"] for field in config.fields_get(_SETTINGS_FIELDS, ["string"]).values()]
         options = {"screen_context": context} if context else {}
-        if config.local_tools:
+        if config.local_tools and data:
             options["native_tools"] = True
         return options
 
     def _store_explanation(self, client, config, history, context, steps, screens=()):
         """Ask the provider to explain screen metadata (no tools) and store the answer, with previews of the
         buttons of the inspected ``screens`` that the question names."""
-        explanation, extra_calls = client.reply(config.model_id.identifier, history, [], screen_context=context)
+        explanation, extra_calls = client.reply(self._model(config).identifier, history, [],
+                                                screen_context=dict(context, **self._menus_named()))
         if extra_calls or not explanation.strip():
             raise UserError(_("The AI provider did not return an explanation. Please retry."))
         self._store_answer(explanation, execution_steps=list(steps), payload=self._named_apps(screens))
+
+    def _latest_question(self):
+        """The text of the user's latest message in this conversation."""
+        return self.env["odoo.ai.assistant.message"].search(
+            [("conversation_id", "=", self.id), ("role", "=", "user")], order="id desc", limit=1,
+        ).content or ""
+
+    def _menus_named(self):
+        """Screen context naming where each screen in the latest question is, its model and whether the AI may read
+        that model's records ({} when the question names no screen)."""
+        named = menus_named_in(self.env, self._latest_question())
+        readable = set(chart_models(self.env)) if named and self.env[
+            "odoo.ai.assistant.config"]._configuration().local_tools else set()
+        for menu in named:
+            if "model" in menu:
+                menu["ai_can_read"] = menu["model"] in readable
+        return {"named_menus": named} if named else {}
 
     def _named_apps(self, screens=()):
         """The apps and buttons the latest question names, so the chat shows their icons and what the buttons
         look like under a written answer. Buttons come from the screens the AI inspected and from the screens of
         the named apps (or the app open now), so the previews do not depend on which screen the AI chose."""
-        question = self.env["odoo.ai.assistant.message"].search(
-            [("conversation_id", "=", self.id), ("role", "=", "user")], order="id desc", limit=1,
-        ).content or ""
+        question = self._latest_question()
         apps, buttons = apps_named_in(self.env, question), []
         if self.env["odoo.ai.assistant.config"]._configuration().screen_metadata:
             current = (current_screen(self.env, self.env.context.get("odoo_ai_screen")) or {}).get("app")
@@ -629,16 +673,22 @@ class AIConversation(models.Model):
         catalogue = self.env["odoo.ai.assistant.native.mcp"]._catalogue()
         selected = [tool for tool in tools
                     if (tool["name"] in catalogue and catalogue[tool["name"]]["mutation"]) == action]
-        matching = [tool for tool in selected if operation and catalogue[tool["name"]]["operation"] == operation]
+        matching = [tool for tool in selected if operation and (
+            catalogue[tool["name"]]["operation"] == operation or tool["name"] == PRESS_TOOL)]
         return matching or selected
 
     def _try_dispatch(self, client, config, history, calls, steps, action_request):
-        """Run tool calls in a savepoint. Return why Odoo refused them, or None when they ran."""
+        """Run tool calls in a savepoint. Return why Odoo refused them, or None when they ran or Odoo has answered
+        instead (a missing MCP Server permission, a value only the user can give)."""
         try:
             with self.env.cr.savepoint():
                 self._dispatch_calls(client, config, history, calls, steps, action_request=action_request)
         except ProviderError:
             raise
+        except DirectReply as error:
+            # Another tool would not help: say what is needed, in plain words.
+            self._store_answer(str(error.args[0]), execution_steps=steps)
+            return None
         # ValueError covers Odoo domain errors such as an invented field name.
         except (AccessError, ValidationError, UserError, ValueError) as error:
             return str(error.args[0]) if error.args else str(error)
@@ -657,7 +707,7 @@ class AIConversation(models.Model):
             "that fits, or answer without tools. Do not repeat the same call. If you explain the reason, keep "
             "Odoo's menu paths and names exactly as written.]" % (reason, self._field_hint(reason))
         ))]
-        text, retry_calls = client.reply(config.model_id.identifier, retry_history, tools, **options)
+        text, retry_calls = client.reply(self._model(config).identifier, retry_history, tools, **options)
         if retry_calls:
             reason = self._try_dispatch(client, config, retry_history, retry_calls, steps, action_request)
             if reason is None:
@@ -750,7 +800,7 @@ class AIConversation(models.Model):
             options = self._reply_context(config)
             options["screen_context"]["discovered_schemas"] = discovery
             next_tools = [tool for tool in tools if not allow_native_only or tool["name"].startswith(NATIVE_TOOL_PREFIX)]
-            text, next_calls = client.reply(config.model_id.identifier, history, next_tools, **options)
+            text, next_calls = client.reply(self._model(config).identifier, history, next_tools, **options)
             if next_calls:
                 self._dispatch_calls(client, config, history, next_calls, steps,
                                      allow_native_only=allow_native_only, discovery_depth=discovery_depth + 1,

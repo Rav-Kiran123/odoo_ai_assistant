@@ -106,6 +106,11 @@ export class LocalVisualization extends Component {
             this.props.payload.total >= 0;
     }
 
+    /** Whether the card links to records the confirmed action created or changed (not a download). */
+    get linksChangedRecords() {
+        return this.props.payload.links.some((link) => link.url.startsWith("/odoo/"));
+    }
+
     get planState() {
         return {
             pending: _t("Pending confirmation"),
